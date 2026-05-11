@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Time Checker</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+
+    /* ── Layout ── */
+    .view { display: none; }
+    .view.active { display: block; }
+    header { padding: 20px 28px; border-bottom: 1px solid #1e293b; display: flex; align-items: center; gap: 12px; }
+    header h1 { font-size: 17px; font-weight: 600; }
+    .header-right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+    .today-total { font-size: 13px; color: #94a3b8; }
+    .today-total span { color: #e2e8f0; font-weight: 600; }
+    .back-btn { background: none; border: none; color: #94a3b8; font-size: 14px; cursor: pointer; display: flex; align-items: center; gap: 6px; padding: 4px 0; }
+    .back-btn:hover { color: #e2e8f0; }
+
+    /* ── Cards ── */
+    .page { padding: 28px; max-width: 720px; margin: 0 auto; }
+    .card { background: #1e293b; border-radius: 14px; padding: 22px; margin-bottom: 18px; }
+    .card-title { font-size: 11px; font-weight: 600; color: #475569; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 16px; }
+
+    /* ── Add task form ── */
+    .add-form { display: flex; gap: 8px; margin-bottom: 20px; }
+    .add-form input[type="text"] { flex: 1; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #e2e8f0; padding: 9px 14px; font-size: 14px; outline: none; }
+    .add-form input[type="text"]:focus { border-color: #3b82f6; }
+    .add-form select { background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #e2e8f0; padding: 9px 10px; font-size: 13px; outline: none; }
+    .btn { padding: 9px 16px; border-radius: 8px; border: none; font-size: 13px; cursor: pointer; font-weight: 500; transition: opacity 0.15s; }
+    .btn:hover { opacity: 0.85; }
+    .btn-primary { background: #3b82f6; color: #fff; }
+    .btn-green { background: #22c55e; color: #fff; }
+    .btn-red { background: #ef4444; color: #fff; }
+    .btn-done { background: #16a34a; color: #fff; }
+    .btn-ghost { background: #1e3a5f; color: #93c5fd; }
+
+    /* ── Filter tabs ── */
+    .filters { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+    .filter-btn { padding: 5px 14px; border-radius: 20px; font-size: 12px; cursor: pointer; border: 1px solid #334155; background: transparent; color: #64748b; transition: all 0.15s; }
+    .filter-btn.active { background: #3b82f6; border-color: #3b82f6; color: #fff; }
+
+    /* ── Todo list items ── */
+    .todo-item { display: flex; align-items: center; gap: 12px; padding: 13px 16px; background: #0f172a; border-radius: 10px; margin-bottom: 8px; border: 1px solid transparent; cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+    .todo-item:hover { border-color: #334155; }
+    .todo-item.in_progress { border-color: #22c55e55; background: #052e1688; }
+    .todo-item.done { opacity: 0.45; cursor: default; }
+    .status-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+    .dot-todo { background: #475569; }
+    .dot-in_progress { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
+    .dot-paused { background: #eab308; }
+    .dot-done { background: #334155; }
+    .priority-badge { font-size: 10px; padding: 2px 7px; border-radius: 10px; flex-shrink: 0; font-weight: 600; }
+    .p-high { background: #7f1d1d; color: #fca5a5; }
+    .p-medium { background: #713f12; color: #fcd34d; }
+    .p-low { background: #14532d; color: #86efac; }
+    .todo-title-text { flex: 1; font-size: 14px; }
+    .todo-item.done .todo-title-text { text-decoration: line-through; }
+    .todo-time-badge { font-size: 12px; color: #64748b; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .todo-item.in_progress .todo-time-badge { color: #22c55e; }
+    .go-btn { padding: 5px 12px; border-radius: 6px; border: none; font-size: 12px; cursor: pointer; background: #1e3a5f; color: #93c5fd; flex-shrink: 0; }
+    .go-btn:hover { background: #1d4ed8; color: #fff; }
+    .todo-empty { text-align: center; padding: 40px; color: #334155; font-size: 14px; }
+
+    /* ── Timer detail view ── */
+    .timer-hero { text-align: center; padding: 40px 20px; }
+    .timer-task-name { font-size: 22px; font-weight: 600; margin-bottom: 10px; color: #f1f5f9; }
+    .timer-display { font-size: 64px; font-weight: 700; letter-spacing: -2px; color: #22c55e; line-height: 1; font-variant-numeric: tabular-nums; margin-bottom: 20px; transition: color 0.3s; }
+    .timer-display.idle { color: #eab308; }
+    .timer-display.excluded { color: #ef4444; }
+    .timer-display.paused { color: #475569; }
+    .tracker-status { display: inline-flex; align-items: center; gap: 8px; padding: 6px 16px; border-radius: 20px; font-size: 13px; font-weight: 500; }
+    .status-tracking { background: #052e16; color: #22c55e; }
+    .status-idle { background: #422006; color: #fbbf24; }
+    .status-excluded { background: #450a0a; color: #f87171; }
+    .status-paused { background: #1e293b; color: #64748b; }
+    .timer-actions { display: flex; justify-content: center; gap: 12px; margin-top: 28px; }
+
+    /* ── App breakdown ── */
+    .app-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid #0f172a; }
+    .app-row:last-child { border-bottom: none; }
+    .app-row.excluded-app { background: #1a0a0a; border-radius: 8px; padding: 9px 10px; border: 1px solid #7f1d1d44; margin-bottom: 4px; }
+    .app-name { flex: 1; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .excluded-icon { font-size: 12px; flex-shrink: 0; }
+    .app-bar-wrap { width: 100px; height: 5px; background: #0f172a; border-radius: 3px; overflow: hidden; }
+    .app-bar { height: 100%; background: #3b82f6; border-radius: 3px; }
+    .app-row.excluded-app .app-bar { background: #ef4444; }
+    .app-time { font-size: 12px; color: #64748b; width: 72px; text-align: right; font-variant-numeric: tabular-nums; }
+    .no-apps { color: #334155; font-size: 13px; text-align: center; padding: 16px 0; }
+
+    /* ── History timeline ── */
+    .history-event { display: flex; align-items: baseline; gap: 10px; padding: 8px 0; border-bottom: 1px solid #0f172a; }
+    .history-event:last-child { border-bottom: none; }
+    .history-time { font-size: 12px; color: #475569; font-variant-numeric: tabular-nums; white-space: nowrap; min-width: 44px; }
+    .history-icon { font-size: 13px; flex-shrink: 0; }
+    .history-label { flex: 1; font-size: 13px; }
+    .history-label.start { color: #22c55e; }
+    .history-label.stop { color: #94a3b8; }
+    .history-label.ongoing { color: #22c55e; font-style: italic; }
+    .history-duration { font-size: 12px; color: #475569; white-space: nowrap; }
+    .history-empty { color: #334155; font-size: 13px; text-align: center; padding: 16px 0; }
+    .history-scroll { max-height: 220px; overflow-y: auto; margin: 0 -22px; padding: 0 22px; }
+
+    /* ── Notes ── */
+    .notes-textarea { width: 100%; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #e2e8f0; padding: 10px 12px; font-size: 13px; line-height: 1.6; resize: vertical; min-height: 80px; outline: none; font-family: inherit; }
+    .notes-textarea:focus { border-color: #3b82f6; }
+    .notes-footer { display: flex; justify-content: flex-end; margin-top: 8px; }
+    .btn-save { background: #1e3a5f; color: #93c5fd; }
+
+    /* ── Bottom tab bar ── */
+    .tab-bar { position: fixed; bottom: 0; left: 0; right: 0; display: flex; background: #1e293b; border-top: 1px solid #334155; z-index: 100; }
+    .tab-btn { flex: 1; padding: 13px; border: none; background: transparent; color: #64748b; font-size: 13px; cursor: pointer; border-top: 2px solid transparent; transition: color 0.15s, border-color 0.15s; }
+    .tab-btn.active { color: #3b82f6; border-top-color: #3b82f6; }
+    .page { padding-bottom: 68px; }
+
+    /* ── Stats view ── */
+    .stats-tabs { display: flex; gap: 6px; margin-bottom: 20px; }
+    .stats-tab { padding: 5px 16px; border-radius: 20px; font-size: 12px; cursor: pointer; border: 1px solid #334155; background: transparent; color: #64748b; transition: all 0.15s; }
+    .stats-tab.active { background: #3b82f6; border-color: #3b82f6; color: #fff; }
+    .stat-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid #0f172a; }
+    .stat-row:last-child { border-bottom: none; }
+    .stat-label { font-size: 12px; color: #94a3b8; min-width: 68px; font-variant-numeric: tabular-nums; }
+    .stat-bar-wrap { flex: 1; height: 6px; background: #0f172a; border-radius: 3px; overflow: hidden; }
+    .stat-bar { height: 100%; background: #3b82f6; border-radius: 3px; transition: width 0.3s; }
+    .stat-time { font-size: 12px; color: #64748b; min-width: 72px; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .stats-empty { color: #334155; font-size: 13px; text-align: center; padding: 24px 0; }
+  </style>
+</head>
+<body>
+
+<!-- ══ VIEW 1: Todo List ══════════════════════════════════════ -->
+<div id="view-list" class="view active">
+  <header>
+    <h1>Time Checker</h1>
+    <div class="header-right">
+      <div class="today-total">오늘 <span id="list-today-total">--</span></div>
+    </div>
+  </header>
+  <div class="page">
+    <div class="add-form">
+      <input type="text" id="newTitle" placeholder="새 작업 이름 (Enter)">
+      <select id="newPriority">
+        <option value="high">🔴 높음</option>
+        <option value="medium" selected>🟡 보통</option>
+        <option value="low">🟢 낮음</option>
+      </select>
+      <button class="btn btn-primary" onclick="addTodo()">추가</button>
+    </div>
+    <div class="filters">
+      <button class="filter-btn active" data-filter="">전체</button>
+      <button class="filter-btn" data-filter="in_progress">진행중</button>
+      <button class="filter-btn" data-filter="todo">할일</button>
+      <button class="filter-btn" data-filter="paused">일시정지</button>
+      <button class="filter-btn" data-filter="done">완료</button>
+    </div>
+    <div id="todoList"></div>
+  </div>
+</div>
+
+<!-- ══ VIEW 2: Timer Detail ═══════════════════════════════════ -->
+<div id="view-task" class="view">
+  <header>
+    <button class="back-btn" onclick="goList()">← 목록</button>
+    <div class="header-right">
+      <div class="today-total">오늘 <span id="task-today-total">--</span></div>
+    </div>
+  </header>
+  <div class="page">
+    <div class="card">
+      <div class="timer-hero">
+        <div class="timer-task-name" id="taskName">-</div>
+        <div class="timer-display" id="timerDisplay">0s</div>
+        <div id="trackerStatus" class="tracker-status status-tracking">● 작업 중</div>
+        <div class="timer-actions">
+          <button class="btn btn-red" id="btnStop" onclick="stopTask()">■ 중단</button>
+          <button class="btn btn-done" onclick="completeTask()">✓ 완료</button>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">앱별 사용 시간 (오늘)</div>
+      <div id="taskAppList"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">작업 이력</div>
+      <div id="taskHistory" class="history-scroll"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">메모</div>
+      <textarea id="taskNotes" class="notes-textarea" placeholder="메모를 입력하세요..."></textarea>
+      <div class="notes-footer">
+        <button class="btn btn-save" id="btnSaveNotes" onclick="saveNotes()">저장</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ VIEW 3: Stats ══════════════════════════════════════════ -->
+<div id="view-stats" class="view">
+  <header>
+    <h1>통계</h1>
+    <div class="header-right">
+      <div class="today-total">오늘 <span id="stats-today-total">--</span></div>
+    </div>
+  </header>
+  <div class="page">
+    <div class="card">
+      <div class="stats-tabs">
+        <button class="stats-tab active" data-mode="daily" onclick="switchStatsMode('daily')">일별</button>
+        <button class="stats-tab" data-mode="weekly" onclick="switchStatsMode('weekly')">주간</button>
+        <button class="stats-tab" data-mode="monthly" onclick="switchStatsMode('monthly')">월간</button>
+      </div>
+      <div id="statsChart"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ Tab Bar ════════════════════════════════════════════════ -->
+<div class="tab-bar" id="tabBar">
+  <button class="tab-btn active" id="tab-list" onclick="goList()">📋 목록</button>
+  <button class="tab-btn" id="tab-stats" onclick="goStats()">📊 통계</button>
+</div>
+
+<script>
+  // ── State ────────────────────────────────────────────────────
+  let _filter = '';
+  let _currentTodoId = null;
+  let _liveBase = 0;
+  let _liveStart = null;
+  let _liveInterval = null;
+  let _statusInterval = null;
+  let _listInterval = null;
+  let _statsMode = 'daily';
+
+  // ── Utilities ────────────────────────────────────────────────
+  function fmt(sec) {
+    sec = Math.max(0, Math.floor(sec));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    if (h) return `${h}h ${String(m).padStart(2,'0')}m ${String(s).padStart(2,'0')}s`;
+    if (m) return `${m}m ${String(s).padStart(2,'0')}s`;
+    return `${s}s`;
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // ── Routing ──────────────────────────────────────────────────
+  function showView(name) {
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    document.getElementById('view-' + name).classList.add('active');
+  }
+
+  function setActiveTab(name) {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    const btn = document.getElementById('tab-' + name);
+    if (btn) btn.classList.add('active');
+    document.getElementById('tabBar').style.display = (name === 'task') ? 'none' : 'flex';
+  }
+
+  function goList() {
+    stopLiveTimer();
+    clearInterval(_statusInterval);
+    _currentTodoId = null;
+    showView('list');
+    setActiveTab('list');
+    loadList();
+    startListInterval();
+  }
+
+  function goStats() {
+    clearInterval(_listInterval);
+    showView('stats');
+    setActiveTab('stats');
+    loadStats();
+  }
+
+  function goTask(id) {
+    clearInterval(_listInterval);
+    showView('task');
+    setActiveTab('task');
+    _currentTodoId = id;
+    loadTaskView(id);
+    _statusInterval = setInterval(() => pollTrackerStatus(), 3000);
+  }
+
+  // ── Live timer ───────────────────────────────────────────────
+  function startLiveTimer(baseSec) {
+    stopLiveTimer();
+    _liveBase = baseSec;
+    _liveStart = Date.now();
+    _liveInterval = setInterval(() => {
+      const elapsed = (Date.now() - _liveStart) / 1000;
+      document.getElementById('timerDisplay').textContent = fmt(_liveBase + elapsed);
+    }, 250);
+  }
+
+  function stopLiveTimer() {
+    clearInterval(_liveInterval);
+    _liveInterval = null;
+  }
+
+  // ── LIST VIEW ────────────────────────────────────────────────
+  function startListInterval() {
+    clearInterval(_listInterval);
+    _listInterval = setInterval(loadList, 5000);
+  }
+
+  async function loadList() {
+    const qs = _filter ? `?status=${_filter}` : '';
+    const [todosRes, sumRes] = await Promise.all([
+      fetch('/api/todos' + qs),
+      fetch('/api/summary/today'),
+    ]);
+    const todosData = await todosRes.json();
+    const sumData = await sumRes.json();
+
+    document.getElementById('list-today-total').textContent = sumData.total_formatted;
+    renderList(todosData.todos);
+  }
+
+  function renderList(todos) {
+    const el = document.getElementById('todoList');
+    if (!todos.length) {
+      el.innerHTML = '<div class="todo-empty">작업이 없습니다</div>';
+      return;
+    }
+
+    // Update live timers for in_progress items
+    const now = Date.now();
+    el.innerHTML = todos.map(t => {
+      const dotClass = `dot-${t.status}`;
+      const pClass = { high:'p-high', medium:'p-medium', low:'p-low' }[t.priority] || 'p-medium';
+      const pLabel = { high:'높음', medium:'보통', low:'낮음' }[t.priority] || '';
+      const isActive = t.status === 'in_progress';
+      const timeStr = fmt(t.total_seconds);
+
+      const goBtn = t.status !== 'done'
+        ? `<button class="go-btn" onclick="event.stopPropagation(); openTask(${t.id})">→</button>`
+        : '';
+
+      return `<div class="todo-item ${t.status}" onclick="${t.status !== 'done' ? `openTask(${t.id})` : ''}">
+        <div class="status-dot ${dotClass}"></div>
+        <span class="priority-badge ${pClass}">${pLabel}</span>
+        <span class="todo-title-text">${esc(t.title)}</span>
+        <span class="todo-time-badge" data-id="${t.id}" data-base="${t.total_seconds}">${timeStr}</span>
+        ${goBtn}
+      </div>`;
+    }).join('');
+
+    // Kick off live counters for in_progress items in list view
+    todos.filter(t => t.status === 'in_progress').forEach(t => {
+      const badge = el.querySelector(`[data-id="${t.id}"]`);
+      if (!badge) return;
+      const base = t.total_seconds;
+      const start = Date.now();
+      // Store interval id on element to clear on next render
+      const iv = setInterval(() => {
+        if (!badge.isConnected) { clearInterval(iv); return; }
+        badge.textContent = fmt(base + (Date.now() - start) / 1000);
+      }, 1000);
+    });
+  }
+
+  async function openTask(id) {
+    // Start timer if not already running, then navigate
+    const res = await fetch(`/api/todos/${id}`);
+    if (!res.ok) return;
+    const todo = await res.json();
+    if (todo.status !== 'in_progress') {
+      await fetch(`/api/todos/${id}/start`, { method: 'POST' });
+    }
+    goTask(id);
+  }
+
+  // ── TASK VIEW ────────────────────────────────────────────────
+  async function loadTaskView(id) {
+    const [todoRes, sumRes, appsRes, histRes] = await Promise.all([
+      fetch(`/api/todos/${id}`),
+      fetch('/api/summary/today'),
+      fetch('/api/apps/today'),
+      fetch(`/api/todos/${id}/history`),
+    ]);
+    const todo = await todoRes.json();
+    const sum = await sumRes.json();
+    const appsData = await appsRes.json();
+    const histData = await histRes.json();
+
+    document.getElementById('taskName').textContent = todo.title;
+    document.getElementById('task-today-total').textContent = sum.total_formatted;
+
+    if (todo.status === 'in_progress') {
+      startLiveTimer(todo.total_seconds);
+    } else {
+      stopLiveTimer();
+      document.getElementById('timerDisplay').textContent = fmt(todo.total_seconds);
+    }
+
+    document.getElementById('taskNotes').value = todo.notes || '';
+    renderApps(appsData.apps);
+    renderHistory(histData.history, todo.status === 'in_progress');
+    pollTrackerStatus();
+  }
+
+  async function saveNotes() {
+    if (!_currentTodoId) return;
+    const notes = document.getElementById('taskNotes').value;
+    await fetch(`/api/todos/${_currentTodoId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notes }),
+    });
+    const btn = document.getElementById('btnSaveNotes');
+    btn.textContent = '저장됨 ✓';
+    setTimeout(() => { btn.textContent = '저장'; }, 1500);
+  }
+
+  // ── STATS VIEW ───────────────────────────────────────────────
+  async function loadStats() {
+    const [sumRes, statsRes] = await Promise.all([
+      fetch('/api/summary/today'),
+      fetch(`/api/stats/${_statsMode}`),
+    ]);
+    const sum = await sumRes.json();
+    const statsData = await statsRes.json();
+    document.getElementById('stats-today-total').textContent = sum.total_formatted;
+    renderStats(statsData.rows);
+  }
+
+  function switchStatsMode(mode) {
+    _statsMode = mode;
+    document.querySelectorAll('.stats-tab').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+    loadStats();
+  }
+
+  function renderStats(rows) {
+    const el = document.getElementById('statsChart');
+    if (!rows || !rows.length) {
+      el.innerHTML = '<div class="stats-empty">데이터 없음</div>';
+      return;
+    }
+    const maxSec = Math.max(...rows.map(r => r.total_seconds), 1);
+    // Show most recent first
+    el.innerHTML = [...rows].reverse().map(r => {
+      const pct = Math.round(r.total_seconds / maxSec * 100);
+      return `<div class="stat-row">
+        <span class="stat-label">${esc(r.label)}</span>
+        <div class="stat-bar-wrap"><div class="stat-bar" style="width:${pct}%"></div></div>
+        <span class="stat-time">${esc(r.formatted)}</span>
+      </div>`;
+    }).join('');
+  }
+
+  function renderHistory(events, isOngoing) {
+    const el = document.getElementById('taskHistory');
+    if (!events || !events.length) {
+      el.innerHTML = '<div class="history-empty">이력 없음</div>';
+      return;
+    }
+    // Latest first
+    const reversed = [...events].reverse();
+    const lastEv = events[events.length - 1];
+    const showOngoing = isOngoing && lastEv && lastEv.type === 'start';
+
+    let html = '';
+    if (showOngoing) {
+      html += `<div class="history-event">
+        <span class="history-time"></span>
+        <span class="history-icon">●</span>
+        <span class="history-label ongoing">진행 중...</span>
+      </div>`;
+    }
+    html += reversed.map(ev => {
+      if (ev.type === 'start') {
+        return `<div class="history-event">
+          <span class="history-time">${esc(ev.time)}</span>
+          <span class="history-icon">▶</span>
+          <span class="history-label start">${esc(ev.label)}</span>
+        </div>`;
+      } else {
+        return `<div class="history-event">
+          <span class="history-time">${esc(ev.time)}</span>
+          <span class="history-icon">■</span>
+          <span class="history-label stop">${esc(ev.label)}</span>
+          <span class="history-duration">${esc(ev.duration)}</span>
+        </div>`;
+      }
+    }).join('');
+    el.innerHTML = html;
+  }
+
+  function renderApps(apps) {
+    const el = document.getElementById('taskAppList');
+    if (!apps || !apps.length) {
+      el.innerHTML = '<div class="no-apps">앱 사용 기록 없음</div>';
+      return;
+    }
+    el.innerHTML = apps.slice(0, 12).map(a => `
+      <div class="app-row ${a.is_excluded ? 'excluded-app' : ''}">
+        ${a.is_excluded ? '<span class="excluded-icon">🚫</span>' : ''}
+        <span class="app-name" title="${esc(a.process_name)}">${esc(a.process_name)}</span>
+        <div class="app-bar-wrap"><div class="app-bar" style="width:${a.percentage}%"></div></div>
+        <span class="app-time">${a.formatted}</span>
+      </div>`).join('');
+  }
+
+  async function pollTrackerStatus() {
+    if (_currentTodoId === null) return;
+    try {
+      const [statusRes, todoRes, histRes] = await Promise.all([
+        fetch('/api/tracker/status'),
+        fetch(`/api/todos/${_currentTodoId}`),
+        fetch(`/api/todos/${_currentTodoId}/history`),
+      ]);
+      const s = await statusRes.json();
+      const todo = await todoRes.json();
+      const histData = await histRes.json();
+      updateStatusUI(s);
+      renderHistory(histData.history, todo.status === 'in_progress');
+    } catch(e) { console.error('pollTrackerStatus error', e); }
+  }
+
+  function updateStatusUI(s) {
+    const display = document.getElementById('timerDisplay');
+    const statusEl = document.getElementById('trackerStatus');
+
+    display.className = 'timer-display';
+    const configs = {
+      tracking: { cls: 'status-tracking', icon: '●', label: '작업 중',   color: '' },
+      idle:     { cls: 'status-idle',     icon: '⏸', label: '유휴 중 (입력 대기)', color: 'idle' },
+      excluded: { cls: 'status-excluded', icon: '🚫', label: `제외 앱${s.excluded_app ? ' — ' + s.excluded_app : ''}`, color: 'excluded' },
+      paused:   { cls: 'status-paused',   icon: '⏹', label: '일시정지', color: 'paused' },
+    };
+    const cfg = configs[s.state] || configs.idle;
+    if (cfg.color) display.classList.add(cfg.color);
+    statusEl.className = `tracker-status ${cfg.cls}`;
+    statusEl.textContent = `${cfg.icon} ${cfg.label}`;
+
+    // Pause/resume live timer based on tracker state
+    if (s.state === 'tracking') {
+      if (!_liveInterval) {
+        // Resume: re-fetch current total_seconds
+        fetch(`/api/todos/${_currentTodoId}`).then(r => r.json()).then(t => {
+          if (t.status === 'in_progress') startLiveTimer(t.total_seconds);
+        });
+      }
+    } else {
+      if (_liveInterval) stopLiveTimer();
+    }
+  }
+
+  async function stopTask() {
+    if (!_currentTodoId) return;
+    await fetch(`/api/todos/${_currentTodoId}/stop`, { method: 'POST' });
+    goList();
+  }
+
+  async function completeTask() {
+    if (!_currentTodoId) return;
+    await fetch(`/api/todos/${_currentTodoId}/complete`, { method: 'POST' });
+    goList();
+  }
+
+  // ── Filter buttons ───────────────────────────────────────────
+  document.querySelectorAll('.filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      _filter = btn.dataset.filter;
+      loadList();
+    });
+  });
+
+  // ── Add todo ─────────────────────────────────────────────────
+  document.getElementById('newTitle').addEventListener('keydown', e => {
+    if (e.key === 'Enter') addTodo();
+  });
+
+  async function addTodo() {
+    const titleEl = document.getElementById('newTitle');
+    const title = titleEl.value.trim();
+    if (!title) return;
+    const priority = document.getElementById('newPriority').value;
+    await fetch('/api/todos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, priority }),
+    });
+    titleEl.value = '';
+    loadList();
+  }
+
+  // ── Boot ─────────────────────────────────────────────────────
+  goList();
+</script>
+</body>
+</html>

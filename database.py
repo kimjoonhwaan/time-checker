@@ -1,0 +1,337 @@
+import sqlite3
+import threading
+from datetime import datetime, timezone
+
+
+class DatabaseManager:
+    def __init__(self, db_path: str):
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._create_tables()
+        self._migrate()
+
+    def _create_tables(self):
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                start_time     TEXT NOT NULL,
+                end_time       TEXT,
+                total_seconds  INTEGER,
+                date           TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS app_activity (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id       INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+                process_name     TEXT NOT NULL,
+                window_title     TEXT,
+                start_time       TEXT NOT NULL,
+                end_time         TEXT,
+                duration_seconds INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS todos (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                title             TEXT NOT NULL,
+                status            TEXT NOT NULL DEFAULT 'todo',
+                priority          TEXT NOT NULL DEFAULT 'medium',
+                total_seconds     INTEGER NOT NULL DEFAULT 0,
+                estimated_seconds INTEGER,
+                notes             TEXT,
+                created_at        TEXT NOT NULL,
+                completed_at      TEXT
+            );
+            CREATE TABLE IF NOT EXISTS todo_sessions (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                todo_id          INTEGER REFERENCES todos(id) ON DELETE CASCADE,
+                start_time       TEXT NOT NULL,
+                end_time         TEXT,
+                duration_seconds INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_date ON sessions(date);
+            CREATE INDEX IF NOT EXISTS idx_app_activity_session ON app_activity(session_id);
+            CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status);
+            CREATE INDEX IF NOT EXISTS idx_todo_sessions_todo ON todo_sessions(todo_id);
+        """)
+        self._conn.commit()
+
+    def _migrate(self):
+        try:
+            self._conn.execute("ALTER TABLE todo_sessions ADD COLUMN pause_reason TEXT")
+            self._conn.commit()
+        except Exception:
+            pass  # column already exists
+
+    def open_session(self, start_time: str, date: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO sessions (start_time, date) VALUES (?, ?)",
+                (start_time, date)
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def close_session(self, session_id: int, end_time: str):
+        with self._lock:
+            self._conn.execute("""
+                UPDATE sessions
+                SET end_time = ?,
+                    total_seconds = CAST(
+                        ROUND((julianday(?) - julianday(start_time)) * 86400) AS INTEGER
+                    )
+                WHERE id = ?
+            """, (end_time, end_time, session_id))
+            self._conn.commit()
+
+    def open_app_activity(self, session_id: int, process_name: str,
+                          window_title: str, start_time: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO app_activity (session_id, process_name, window_title, start_time)
+                   VALUES (?, ?, ?, ?)""",
+                (session_id, process_name, window_title, start_time)
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def close_app_activity(self, activity_id: int, end_time: str):
+        with self._lock:
+            self._conn.execute("""
+                UPDATE app_activity
+                SET end_time = ?,
+                    duration_seconds = CAST(
+                        ROUND((julianday(?) - julianday(start_time)) * 86400) AS INTEGER
+                    )
+                WHERE id = ?
+            """, (end_time, end_time, activity_id))
+            self._conn.commit()
+
+    def close_stale_sessions(self):
+        with self._lock:
+            now = datetime.now(timezone.utc).isoformat()
+            self._conn.execute("""
+                UPDATE sessions SET end_time = start_time, total_seconds = 0
+                WHERE end_time IS NULL
+            """)
+            self._conn.execute("""
+                UPDATE app_activity SET end_time = start_time, duration_seconds = 0
+                WHERE end_time IS NULL
+            """)
+            self._conn.commit()
+
+    def get_today_total_seconds(self, date: str) -> int:
+        cur = self._conn.execute("""
+            SELECT COALESCE(SUM(
+                CASE
+                    WHEN end_time IS NOT NULL THEN total_seconds
+                    ELSE CAST(ROUND((julianday('now') - julianday(start_time)) * 86400) AS INTEGER)
+                END
+            ), 0) FROM sessions WHERE date = ?
+        """, (date,))
+        return cur.fetchone()[0]
+
+    def get_sessions_for_date(self, date: str) -> list:
+        cur = self._conn.execute(
+            "SELECT id, start_time, end_time, total_seconds FROM sessions WHERE date = ? AND end_time IS NOT NULL ORDER BY start_time",
+            (date,)
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_app_breakdown(self, date: str) -> list:
+        cur = self._conn.execute("""
+            SELECT a.process_name, SUM(a.duration_seconds) as total_seconds
+            FROM app_activity a
+            JOIN sessions s ON a.session_id = s.id
+            WHERE s.date = ? AND a.duration_seconds IS NOT NULL
+            GROUP BY a.process_name
+            ORDER BY total_seconds DESC
+        """, (date,))
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_weekly_summary(self, start_date: str, end_date: str) -> list:
+        cur = self._conn.execute("""
+            SELECT date, COALESCE(SUM(total_seconds), 0) as total_seconds
+            FROM sessions
+            WHERE date BETWEEN ? AND ? AND end_time IS NOT NULL
+            GROUP BY date
+            ORDER BY date
+        """, (start_date, end_date))
+        return [dict(row) for row in cur.fetchall()]
+
+    # ── Todo CRUD ────────────────────────────────────────────────
+
+    def create_todo(self, title: str, priority: str = "medium",
+                    estimated_seconds: int = None, notes: str = None) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO todos (title, priority, estimated_seconds, notes, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (title, priority, estimated_seconds, notes, now)
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def get_todos(self, status_filter: str = None) -> list:
+        if status_filter:
+            cur = self._conn.execute(
+                "SELECT * FROM todos WHERE status = ? ORDER BY created_at DESC",
+                (status_filter,)
+            )
+        else:
+            cur = self._conn.execute(
+                "SELECT * FROM todos ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'todo' THEN 1 WHEN 'paused' THEN 2 ELSE 3 END, created_at DESC"
+            )
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_todo(self, todo_id: int) -> dict:
+        cur = self._conn.execute("SELECT * FROM todos WHERE id = ?", (todo_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def update_todo(self, todo_id: int, **fields):
+        allowed = {"title", "priority", "estimated_seconds", "notes", "status"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [todo_id]
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE todos SET {set_clause} WHERE id = ?", values
+            )
+            self._conn.commit()
+
+    def delete_todo(self, todo_id: int):
+        with self._lock:
+            self._conn.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
+            self._conn.commit()
+
+    def get_active_todo_session(self) -> dict:
+        cur = self._conn.execute(
+            """SELECT ts.*, t.title FROM todo_sessions ts
+               JOIN todos t ON ts.todo_id = t.id
+               WHERE ts.end_time IS NULL LIMIT 1"""
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def start_todo_timer(self, todo_id: int) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            # Auto-pause any currently running todo
+            active = self._conn.execute(
+                "SELECT ts.id, ts.todo_id FROM todo_sessions ts WHERE ts.end_time IS NULL LIMIT 1"
+            ).fetchone()
+            if active:
+                self._close_todo_session_locked(active["id"], active["todo_id"], now)
+
+            self._conn.execute(
+                "UPDATE todos SET status = 'in_progress' WHERE id = ?", (todo_id,)
+            )
+            cur = self._conn.execute(
+                "INSERT INTO todo_sessions (todo_id, start_time) VALUES (?, ?)",
+                (todo_id, now)
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def stop_todo_timer(self, todo_id: int, reason: str = 'manual'):
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            session = self._conn.execute(
+                "SELECT id FROM todo_sessions WHERE todo_id = ? AND end_time IS NULL",
+                (todo_id,)
+            ).fetchone()
+            if session:
+                self._close_todo_session_locked(session["id"], todo_id, now, reason)
+            self._conn.execute(
+                "UPDATE todos SET status = 'paused' WHERE id = ? AND status = 'in_progress'",
+                (todo_id,)
+            )
+            self._conn.commit()
+
+    def complete_todo(self, todo_id: int):
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            session = self._conn.execute(
+                "SELECT id FROM todo_sessions WHERE todo_id = ? AND end_time IS NULL",
+                (todo_id,)
+            ).fetchone()
+            if session:
+                self._close_todo_session_locked(session["id"], todo_id, now, 'completed')
+            self._conn.execute(
+                "UPDATE todos SET status = 'done', completed_at = ? WHERE id = ?",
+                (now, todo_id)
+            )
+            self._conn.commit()
+
+    def _close_todo_session_locked(self, session_id: int, todo_id: int,
+                                   end_time: str, reason: str = None):
+        self._conn.execute("""
+            UPDATE todo_sessions
+            SET end_time = ?,
+                duration_seconds = CAST(
+                    ROUND((julianday(?) - julianday(start_time)) * 86400) AS INTEGER
+                ),
+                pause_reason = ?
+            WHERE id = ?
+        """, (end_time, end_time, reason, session_id))
+        self._conn.execute("""
+            UPDATE todos SET total_seconds = (
+                SELECT COALESCE(SUM(duration_seconds), 0)
+                FROM todo_sessions WHERE todo_id = ? AND end_time IS NOT NULL
+            ) WHERE id = ?
+        """, (todo_id, todo_id))
+
+    def get_todo_history(self, todo_id: int) -> list:
+        cur = self._conn.execute("""
+            SELECT start_time, end_time, duration_seconds, pause_reason
+            FROM todo_sessions WHERE todo_id = ?
+            ORDER BY start_time ASC
+        """, (todo_id,))
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_daily_summary(self, days: int = 14) -> list:
+        cur = self._conn.execute("""
+            SELECT date, COALESCE(SUM(
+                CASE WHEN end_time IS NOT NULL THEN total_seconds
+                     ELSE CAST(ROUND((julianday('now') - julianday(start_time)) * 86400) AS INTEGER)
+                END
+            ), 0) as total_seconds
+            FROM sessions
+            WHERE date >= date('now', ?)
+            GROUP BY date ORDER BY date
+        """, (f'-{days - 1} days',))
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_weekly_totals(self, weeks: int = 8) -> list:
+        cur = self._conn.execute("""
+            SELECT strftime('%Y-%W', date) as week,
+                   COALESCE(SUM(total_seconds), 0) as total_seconds
+            FROM sessions
+            WHERE date >= date('now', ?) AND end_time IS NOT NULL
+            GROUP BY week ORDER BY week
+        """, (f'-{weeks * 7} days',))
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_monthly_totals(self, months: int = 6) -> list:
+        cur = self._conn.execute("""
+            SELECT strftime('%Y-%m', date) as month,
+                   COALESCE(SUM(total_seconds), 0) as total_seconds
+            FROM sessions
+            WHERE date >= date('now', ?) AND end_time IS NOT NULL
+            GROUP BY month ORDER BY month
+        """, (f'-{months} months',))
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_completed_today_count(self, date: str) -> int:
+        cur = self._conn.execute(
+            "SELECT COUNT(*) FROM todos WHERE status = 'done' AND DATE(completed_at) = ?",
+            (date,)
+        )
+        return cur.fetchone()[0]
+
+    def close(self):
+        self._conn.close()

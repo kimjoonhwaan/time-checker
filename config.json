@@ -1,0 +1,25 @@
+{
+  "idle_threshold_seconds": 60,
+  "poll_interval_seconds": 30,
+  "flask_port": 5000,
+  "excluded_processes": [
+    "vlc.exe",
+    "netflix.exe",
+    "spotify.exe",
+    "steam.exe",
+    "epicgameslauncher.exe",
+    "leagueclient.exe"
+  ],
+  "excluded_title_keywords": [
+    "YouTube",
+    "Netflix",
+    "Twitch",
+    "Spotify",
+    "Prime Video",
+    "Disney+",
+    "Hulu",
+    "Crunchyroll",
+    "wavve",
+    "tving"
+  ]
+}

@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements-server.txt
 
 COPY app.py database.py paths.py server.py ./
 COPY templates ./templates
+COPY config.example.json ./config.json
 
 ENV TIMECHECKER_DATA_DIR=/data
 ENV PYTHONUNBUFFERED=1

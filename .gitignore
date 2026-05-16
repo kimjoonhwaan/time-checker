@@ -5,6 +5,8 @@ __pycache__/
 *.db-wal
 .env
 .omc/
+config.json
+
 .ai-index/
 build/
 dist/

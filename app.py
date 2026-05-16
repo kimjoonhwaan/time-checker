@@ -239,6 +239,14 @@ def ingest_todo_active():
     return jsonify({"active": row})
 
 
+@flask_app.route("/api/admin/cleanup", methods=["POST"])
+def admin_cleanup():
+    err = _require_api_key()
+    if err: return err
+    report = _db.cleanup_stale_open_sessions()
+    return jsonify(report)
+
+
 @flask_app.route("/api/ingest/heartbeat", methods=["POST"])
 def ingest_heartbeat():
     err = _require_api_key()

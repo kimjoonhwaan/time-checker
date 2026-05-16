@@ -161,16 +161,82 @@ class DatabaseManager:
             """)
             self._conn.commit()
 
+    # An open session is only counted as "live" for this many seconds after
+    # its start. Beyond that we treat it as abandoned (tracker crashed/restarted
+    # without closing it) and exclude it from totals; a separate cleanup pass
+    # closes it using the last child app_activity's end_time as the real end.
+    _STALE_OPEN_SECONDS = 600  # 10 minutes
+
     def get_today_total_seconds(self, date: str) -> int:
-        cur = self._conn.execute("""
+        cur = self._conn.execute(f"""
             SELECT COALESCE(SUM(
                 CASE
                     WHEN end_time IS NOT NULL THEN total_seconds
-                    ELSE CAST(ROUND((julianday('now') - julianday(start_time)) * 86400) AS INTEGER)
+                    WHEN (julianday('now') - julianday(start_time)) * 86400 < {self._STALE_OPEN_SECONDS}
+                        THEN CAST(ROUND((julianday('now') - julianday(start_time)) * 86400) AS INTEGER)
+                    ELSE 0
                 END
             ), 0) FROM sessions WHERE date = ?
         """, (date,))
         return cur.fetchone()[0]
+
+    def cleanup_stale_open_sessions(self) -> dict:
+        """Close sessions that have been open longer than _STALE_OPEN_SECONDS.
+
+        For each stale open session, sets end_time to MAX(start_time, last
+        child app_activity end_time) so any genuinely measured time isn't lost.
+        Also closes any orphan app_activity rows that lost their parent.
+
+        Returns a small report.
+        """
+        with self._lock:
+            stale = self._conn.execute(f"""
+                SELECT id, start_time FROM sessions
+                WHERE end_time IS NULL
+                  AND (julianday('now') - julianday(start_time)) * 86400 >= {self._STALE_OPEN_SECONDS}
+            """).fetchall()
+
+            closed_sessions = 0
+            closed_activities = 0
+            for row in stale:
+                sid = row["id"]
+                start_time = row["start_time"]
+                # Find latest activity end_time for this session as best-guess end.
+                last_end = self._conn.execute(
+                    "SELECT MAX(end_time) AS x FROM app_activity "
+                    "WHERE session_id = ? AND end_time IS NOT NULL",
+                    (sid,)
+                ).fetchone()["x"]
+                end_time = last_end if last_end else start_time
+                # Close any still-open activities under this session first.
+                orphan_acts = self._conn.execute(
+                    "SELECT id FROM app_activity "
+                    "WHERE session_id = ? AND end_time IS NULL", (sid,)
+                ).fetchall()
+                for a in orphan_acts:
+                    self._conn.execute("""
+                        UPDATE app_activity
+                        SET end_time = ?,
+                            duration_seconds = CAST(
+                                ROUND((julianday(?) - julianday(start_time)) * 86400) AS INTEGER
+                            )
+                        WHERE id = ?
+                    """, (end_time, end_time, a["id"]))
+                    closed_activities += 1
+                self._conn.execute("""
+                    UPDATE sessions
+                    SET end_time = ?,
+                        total_seconds = CAST(
+                            ROUND((julianday(?) - julianday(start_time)) * 86400) AS INTEGER
+                        )
+                    WHERE id = ?
+                """, (end_time, end_time, sid))
+                closed_sessions += 1
+            self._conn.commit()
+            return {
+                "closed_sessions": closed_sessions,
+                "closed_activities": closed_activities,
+            }
 
     def get_sessions_for_date(self, date: str) -> list:
         cur = self._conn.execute(
@@ -335,10 +401,13 @@ class DatabaseManager:
         return [dict(row) for row in cur.fetchall()]
 
     def get_daily_summary(self, days: int = 14) -> list:
-        cur = self._conn.execute("""
+        cur = self._conn.execute(f"""
             SELECT date, COALESCE(SUM(
-                CASE WHEN end_time IS NOT NULL THEN total_seconds
-                     ELSE CAST(ROUND((julianday('now') - julianday(start_time)) * 86400) AS INTEGER)
+                CASE
+                    WHEN end_time IS NOT NULL THEN total_seconds
+                    WHEN (julianday('now') - julianday(start_time)) * 86400 < {self._STALE_OPEN_SECONDS}
+                        THEN CAST(ROUND((julianday('now') - julianday(start_time)) * 86400) AS INTEGER)
+                    ELSE 0
                 END
             ), 0) as total_seconds
             FROM sessions

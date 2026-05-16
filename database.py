@@ -161,23 +161,30 @@ class DatabaseManager:
             """)
             self._conn.commit()
 
-    # An open session is only counted as "live" for this many seconds after
-    # its start. Beyond that we treat it as abandoned (tracker crashed/restarted
-    # without closing it) and exclude it from totals; a separate cleanup pass
-    # closes it using the last child app_activity's end_time as the real end.
-    _STALE_OPEN_SECONDS = 600  # 10 minutes
+    # An open session is treated as "live" only if (a) it is the most recently
+    # opened session for the day (older open sessions are crash leftovers,
+    # contribute 0) and (b) it hasn't been open for more than this many seconds
+    # (safety cap if tracker is dead but stays open). Tracker normally closes
+    # the session on idle/excluded transitions; long uninterrupted work is OK.
+    _STALE_OPEN_SECONDS = 14400  # 4 hours
 
     def get_today_total_seconds(self, date: str) -> int:
         cur = self._conn.execute(f"""
+            WITH live AS (
+                SELECT MAX(id) AS id FROM sessions
+                WHERE end_time IS NULL AND date = ?
+            )
             SELECT COALESCE(SUM(
                 CASE
-                    WHEN end_time IS NOT NULL THEN total_seconds
-                    WHEN (julianday('now') - julianday(start_time)) * 86400 < {self._STALE_OPEN_SECONDS}
-                        THEN CAST(ROUND((julianday('now') - julianday(start_time)) * 86400) AS INTEGER)
+                    WHEN s.end_time IS NOT NULL THEN s.total_seconds
+                    WHEN s.id = (SELECT id FROM live)
+                         AND (julianday('now') - julianday(s.start_time)) * 86400 < {self._STALE_OPEN_SECONDS}
+                        THEN CAST(ROUND((julianday('now') - julianday(s.start_time)) * 86400) AS INTEGER)
                     ELSE 0
                 END
-            ), 0) FROM sessions WHERE date = ?
-        """, (date,))
+            ), 0)
+            FROM sessions s WHERE s.date = ?
+        """, (date, date))
         return cur.fetchone()[0]
 
     def cleanup_stale_open_sessions(self) -> dict:
@@ -402,17 +409,22 @@ class DatabaseManager:
 
     def get_daily_summary(self, days: int = 14) -> list:
         cur = self._conn.execute(f"""
-            SELECT date, COALESCE(SUM(
+            WITH live_per_day AS (
+                SELECT date, MAX(id) AS id FROM sessions
+                WHERE end_time IS NULL GROUP BY date
+            )
+            SELECT s.date, COALESCE(SUM(
                 CASE
-                    WHEN end_time IS NOT NULL THEN total_seconds
-                    WHEN (julianday('now') - julianday(start_time)) * 86400 < {self._STALE_OPEN_SECONDS}
-                        THEN CAST(ROUND((julianday('now') - julianday(start_time)) * 86400) AS INTEGER)
+                    WHEN s.end_time IS NOT NULL THEN s.total_seconds
+                    WHEN s.id = (SELECT id FROM live_per_day WHERE date = s.date)
+                         AND (julianday('now') - julianday(s.start_time)) * 86400 < {self._STALE_OPEN_SECONDS}
+                        THEN CAST(ROUND((julianday('now') - julianday(s.start_time)) * 86400) AS INTEGER)
                     ELSE 0
                 END
-            ), 0) as total_seconds
-            FROM sessions
-            WHERE date >= date('now', ?)
-            GROUP BY date ORDER BY date
+            ), 0) AS total_seconds
+            FROM sessions s
+            WHERE s.date >= date('now', ?)
+            GROUP BY s.date ORDER BY s.date
         """, (f'-{days - 1} days',))
         return [dict(row) for row in cur.fetchall()]
 

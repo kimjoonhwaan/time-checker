@@ -319,7 +319,7 @@
     const todosData = await todosRes.json();
     const sumData = await sumRes.json();
 
-    document.getElementById('list-today-total').textContent = sumData.total_formatted;
+    document.getElementById('list-today-total').textContent = sumData.todo_total_formatted || sumData.total_formatted;
     renderList(todosData.todos);
   }
 
@@ -391,7 +391,7 @@
     const histData = await histRes.json();
 
     document.getElementById('taskName').textContent = todo.title;
-    document.getElementById('task-today-total').textContent = sum.total_formatted;
+    document.getElementById('task-today-total').textContent = sum.todo_total_formatted || sum.total_formatted;
 
     if (todo.status === 'in_progress') {
       startLiveTimer(todo.total_seconds);
@@ -427,7 +427,7 @@
     ]);
     const sum = await sumRes.json();
     const statsData = await statsRes.json();
-    document.getElementById('stats-today-total').textContent = sum.total_formatted;
+    document.getElementById('stats-today-total').textContent = sum.todo_total_formatted || sum.total_formatted;
     renderStats(statsData.rows);
   }
 

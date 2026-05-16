@@ -15,6 +15,7 @@ import os
 import socket
 import threading
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import paths
@@ -109,6 +110,22 @@ def main():
         dashboard_url = None  # tray will compute from config
 
     tracker = TrackerLoop(backend, config, shutdown_event, pause_event)
+
+    # Resume hint: if previous shutdown was recent, backdate the next session
+    # so the gap counts as continuous activity.
+    marker = paths.shutdown_marker_path(config)
+    if marker.exists():
+        try:
+            saved = json.loads(marker.read_text())
+            last = datetime.fromisoformat(saved["time"])
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            gap = (datetime.now(timezone.utc) - last).total_seconds()
+            if 0 < gap < 300:
+                tracker.set_resume_start_time(last.isoformat())
+        except Exception:
+            pass
+
     tracker_thread = threading.Thread(target=tracker.run, daemon=True, name="tracker")
     tracker_thread.start()
 
@@ -129,7 +146,19 @@ def main():
                    dashboard_url=dashboard_url)
     tray.run()  # blocks — owns main thread
 
-    # Shutdown cleanup
+    # Shutdown cleanup — close any in-flight session BEFORE the backend
+    # (so the close_session POST goes into the queue / DB), then write a
+    # marker so the next launch can backdate the gap.
+    try:
+        tracker.close_active_session()
+    except Exception:
+        pass
+    try:
+        paths.shutdown_marker_path(config).write_text(json.dumps({
+            "time": datetime.now(timezone.utc).isoformat()
+        }))
+    except Exception:
+        pass
     try:
         if not server_url:
             backend.close_stale_sessions()

@@ -87,5 +87,11 @@ def log_dir(config: dict | None = None) -> Path:
     return p
 
 
+def shutdown_marker_path(config: dict | None = None) -> Path:
+    """JSON file written on clean tracker shutdown; read on next start
+    to backdate the first session if the gap was small."""
+    return data_dir(config) / "last_shutdown.json"
+
+
 def project_dir() -> Path:
     return _PROJECT_DIR

@@ -49,11 +49,14 @@ def dashboard():
 def summary_today():
     date = datetime.now().strftime("%Y-%m-%d")
     total = _db.get_today_total_seconds(date)
+    todo_total = _db.get_today_todo_total_seconds(date)
     sessions = _db.get_sessions_for_date(date)
     return jsonify({
         "date": date,
         "total_seconds": total,
         "total_formatted": format_duration(total),
+        "todo_total_seconds": todo_total,
+        "todo_total_formatted": format_duration(todo_total),
         "sessions": sessions
     })
 

@@ -448,6 +448,36 @@ class DatabaseManager:
         """, (f'-{months} months',))
         return [dict(row) for row in cur.fetchall()]
 
+    def get_today_todo_total_seconds(self, date: str) -> int:
+        """Sum of all time spent on todos today (UTC date).
+
+        Includes any currently in-progress todo's elapsed time since
+        its session started, so the dashboard counter ticks live.
+        """
+        closed = self._conn.execute("""
+            SELECT COALESCE(SUM(duration_seconds), 0)
+            FROM todo_sessions
+            WHERE end_time IS NOT NULL
+              AND substr(start_time, 1, 10) = ?
+        """, (date,)).fetchone()[0]
+        row = self._conn.execute("""
+            SELECT start_time FROM todo_sessions
+            WHERE end_time IS NULL
+            ORDER BY id DESC LIMIT 1
+        """).fetchone()
+        active = 0
+        if row:
+            try:
+                start = datetime.fromisoformat(row["start_time"])
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=timezone.utc)
+                active = max(0, int(
+                    (datetime.now(timezone.utc) - start).total_seconds()
+                ))
+            except Exception:
+                pass
+        return closed + active
+
     def get_completed_today_count(self, date: str) -> int:
         cur = self._conn.execute(
             "SELECT COUNT(*) FROM todos WHERE status = 'done' AND DATE(completed_at) = ?",

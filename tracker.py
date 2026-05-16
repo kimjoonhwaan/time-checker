@@ -87,6 +87,7 @@ class TrackerLoop:
         self._excluded_app_name: Optional[str] = None
         self._auto_paused_todo_id: Optional[int] = None
         self._lock = threading.Lock()
+        self._resume_start_time: Optional[str] = None
 
     def run(self):
         poll = self._config.get("poll_interval_seconds", 30)
@@ -157,14 +158,28 @@ class TrackerLoop:
                 pass
             self._auto_paused_todo_id = None
 
+    def set_resume_start_time(self, iso_time: str):
+        """One-shot hint: backdate the next opened session to this start time.
+
+        Used right after a restart so that a small gap between the previous
+        tracker shutdown and now is not lost.
+        """
+        self._resume_start_time = iso_time
+
+    def close_active_session(self):
+        """Force-close any in-flight session and activity. Safe to call from
+        the main thread on shutdown."""
+        self._end_session()
+
     def _start_session(self, window: WindowInfo):
         now = datetime.now(timezone.utc)
         date = now.strftime("%Y-%m-%d")
-        now_iso = now.isoformat()
+        start_iso = self._resume_start_time or now.isoformat()
+        self._resume_start_time = None  # consume once
         with self._lock:
-            self._current_session_id = self._db.open_session(now_iso, date)
+            self._current_session_id = self._db.open_session(start_iso, date)
             self._current_activity_id = self._db.open_app_activity(
-                self._current_session_id, window.process_name, window.window_title, now_iso
+                self._current_session_id, window.process_name, window.window_title, start_iso
             )
             self._current_window = window
 

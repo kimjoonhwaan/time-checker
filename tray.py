@@ -24,12 +24,14 @@ ICONS = {
 
 class TrayApp:
     def __init__(self, tracker, db, config: dict,
-                 shutdown_event: threading.Event, pause_event: threading.Event):
+                 shutdown_event: threading.Event, pause_event: threading.Event,
+                 dashboard_url: str = None):
         self._tracker = tracker
-        self._db = db
+        self._db = db  # unused in remote mode; kept for backward compat
         self._config = config
         self._shutdown = shutdown_event
         self._pause = pause_event
+        self._dashboard_url = dashboard_url
         self._icon = pystray.Icon(
             name="timechecker",
             icon=ICONS[TrackerState.IDLE],
@@ -65,6 +67,9 @@ class TrayApp:
         return f"오늘: {h}h {m:02d}m  ({label})"
 
     def _open_dashboard(self, icon, item):
+        if self._dashboard_url:
+            webbrowser.open(self._dashboard_url)
+            return
         port = self._config.get("_actual_port", self._config.get("flask_port", 5000))
         webbrowser.open(f"http://localhost:{port}")
 

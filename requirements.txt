@@ -3,3 +3,4 @@ psutil
 pystray
 Pillow
 Flask
+requests

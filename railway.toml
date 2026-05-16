@@ -1,0 +1,17 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+numReplicas = 1
+restartPolicyType = "ALWAYS"
+healthcheckPath = "/"
+healthcheckTimeout = 30
+
+# Volume must also be created/attached in the Railway dashboard:
+#   Name:       timechecker-data
+#   Mount path: /data
+#
+# Required environment variables (set in Railway dashboard, not here):
+#   TIMECHECKER_API_KEY = <random 32-byte hex>   # clients send this in X-API-Key
+#   TIMECHECKER_DATA_DIR = /data                  # already set in Dockerfile

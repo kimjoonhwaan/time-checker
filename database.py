@@ -57,17 +57,47 @@ class DatabaseManager:
         self._conn.commit()
 
     def _migrate(self):
+        migrations = [
+            "ALTER TABLE todo_sessions ADD COLUMN pause_reason TEXT",
+            "ALTER TABLE sessions ADD COLUMN device_id TEXT",
+            "ALTER TABLE sessions ADD COLUMN client_event_id TEXT",
+            "ALTER TABLE app_activity ADD COLUMN device_id TEXT",
+            "ALTER TABLE app_activity ADD COLUMN client_event_id TEXT",
+            "ALTER TABLE todos ADD COLUMN device_id TEXT",
+            "ALTER TABLE todo_sessions ADD COLUMN device_id TEXT",
+            "ALTER TABLE todo_sessions ADD COLUMN client_event_id TEXT",
+        ]
+        for sql in migrations:
+            try:
+                self._conn.execute(sql)
+            except Exception:
+                pass
         try:
-            self._conn.execute("ALTER TABLE todo_sessions ADD COLUMN pause_reason TEXT")
-            self._conn.commit()
+            self._conn.executescript("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_client_event
+                    ON sessions(client_event_id) WHERE client_event_id IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_activity_client_event
+                    ON app_activity(client_event_id) WHERE client_event_id IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_todo_sessions_client_event
+                    ON todo_sessions(client_event_id) WHERE client_event_id IS NOT NULL;
+            """)
         except Exception:
-            pass  # column already exists
+            pass
+        self._conn.commit()
 
-    def open_session(self, start_time: str, date: str) -> int:
+    def open_session(self, start_time: str, date: str,
+                     device_id: str = None, client_event_id: str = None) -> int:
         with self._lock:
+            if client_event_id:
+                row = self._conn.execute(
+                    "SELECT id FROM sessions WHERE client_event_id = ?", (client_event_id,)
+                ).fetchone()
+                if row:
+                    return row["id"]
             cur = self._conn.execute(
-                "INSERT INTO sessions (start_time, date) VALUES (?, ?)",
-                (start_time, date)
+                "INSERT INTO sessions (start_time, date, device_id, client_event_id) "
+                "VALUES (?, ?, ?, ?)",
+                (start_time, date, device_id, client_event_id)
             )
             self._conn.commit()
             return cur.lastrowid
@@ -85,12 +115,23 @@ class DatabaseManager:
             self._conn.commit()
 
     def open_app_activity(self, session_id: int, process_name: str,
-                          window_title: str, start_time: str) -> int:
+                          window_title: str, start_time: str,
+                          device_id: str = None, client_event_id: str = None) -> int:
         with self._lock:
+            if client_event_id:
+                row = self._conn.execute(
+                    "SELECT id FROM app_activity WHERE client_event_id = ?",
+                    (client_event_id,)
+                ).fetchone()
+                if row:
+                    return row["id"]
             cur = self._conn.execute(
-                """INSERT INTO app_activity (session_id, process_name, window_title, start_time)
-                   VALUES (?, ?, ?, ?)""",
-                (session_id, process_name, window_title, start_time)
+                """INSERT INTO app_activity
+                       (session_id, process_name, window_title, start_time,
+                        device_id, client_event_id)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (session_id, process_name, window_title, start_time,
+                 device_id, client_event_id)
             )
             self._conn.commit()
             return cur.lastrowid

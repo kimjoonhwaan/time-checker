@@ -1,23 +1,33 @@
 import json
+import os
 import socket
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
+import paths
+
 flask_app = Flask(__name__)
 _db = None
 _tracker = None
-_config_path = Path(__file__).parent / "config.json"
+_config_path: Path = paths.config_path()
+_api_key: str | None = None
+_last_heartbeat: dict = {"time": None, "device_id": None, "state": "unknown",
+                        "idle_seconds": 0, "excluded_app": None}
 
 
-def init_app(db, tracker=None, config_path: Path = None):
-    global _db, _tracker, _config_path
+def init_app(db, tracker=None, config_path: Path = None, api_key: str = None):
+    global _db, _tracker, _config_path, _api_key
     _db = db
     if tracker is not None:
         _tracker = tracker
     if config_path:
         _config_path = config_path
+    if api_key is not None:
+        _api_key = api_key
+    else:
+        _api_key = os.environ.get("TIMECHECKER_API_KEY")
 
 
 def format_duration(seconds: int) -> str:
@@ -89,9 +99,157 @@ def apps_today():
 @flask_app.route("/api/tracker/status")
 def tracker_status():
     if _tracker is None:
-        return jsonify({"state": "unknown", "today_total_seconds": 0,
-                        "excluded_app": None, "idle_seconds": 0})
+        date = datetime.now().strftime("%Y-%m-%d")
+        total = _db.get_today_total_seconds(date) if _db else 0
+        last_hb = _last_heartbeat.get("time")
+        stale = True
+        if last_hb:
+            try:
+                dt = datetime.fromisoformat(last_hb)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                stale = (datetime.now(timezone.utc) - dt).total_seconds() > 120
+            except Exception:
+                stale = True
+        state = "offline" if stale else _last_heartbeat.get("state", "unknown")
+        return jsonify({
+            "state": state,
+            "today_total_seconds": total,
+            "excluded_app": _last_heartbeat.get("excluded_app"),
+            "idle_seconds": _last_heartbeat.get("idle_seconds", 0),
+            "last_heartbeat": last_hb,
+            "device_id": _last_heartbeat.get("device_id"),
+        })
     return jsonify(_tracker.get_status())
+
+
+# ── Ingest API (write surface for remote clients) ──────────────
+
+def _require_api_key():
+    if not _api_key:
+        return None  # auth disabled (dev mode)
+    if request.headers.get("X-API-Key") != _api_key:
+        return jsonify({"error": "unauthorized"}), 401
+    return None
+
+
+def _resolve_session_id(client_event_id: str) -> int | None:
+    if not client_event_id:
+        return None
+    row = _db._conn.execute(
+        "SELECT id FROM sessions WHERE client_event_id = ?", (client_event_id,)
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def _resolve_activity_id(client_event_id: str) -> int | None:
+    if not client_event_id:
+        return None
+    row = _db._conn.execute(
+        "SELECT id FROM app_activity WHERE client_event_id = ?", (client_event_id,)
+    ).fetchone()
+    return row["id"] if row else None
+
+
+@flask_app.route("/api/ingest/session/open", methods=["POST"])
+def ingest_session_open():
+    err = _require_api_key()
+    if err: return err
+    d = request.get_json(force=True)
+    sid = _db.open_session(
+        start_time=d["start_time"], date=d["date"],
+        device_id=d.get("device_id"),
+        client_event_id=d.get("client_event_id"),
+    )
+    return jsonify({"session_id": sid})
+
+
+@flask_app.route("/api/ingest/session/close", methods=["POST"])
+def ingest_session_close():
+    err = _require_api_key()
+    if err: return err
+    d = request.get_json(force=True)
+    sid = d.get("session_id")
+    if sid is None:
+        sid = _resolve_session_id(d.get("session_client_event_id"))
+    if sid is None:
+        return jsonify({"error": "session not found"}), 404
+    _db.close_session(session_id=int(sid), end_time=d["end_time"])
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/ingest/activity/open", methods=["POST"])
+def ingest_activity_open():
+    err = _require_api_key()
+    if err: return err
+    d = request.get_json(force=True)
+    sid = d.get("session_id")
+    if sid is None:
+        sid = _resolve_session_id(d.get("session_client_event_id"))
+    if sid is None:
+        return jsonify({"error": "session not found"}), 404
+    aid = _db.open_app_activity(
+        session_id=int(sid),
+        process_name=d["process_name"],
+        window_title=d.get("window_title", ""),
+        start_time=d["start_time"],
+        device_id=d.get("device_id"),
+        client_event_id=d.get("client_event_id"),
+    )
+    return jsonify({"activity_id": aid})
+
+
+@flask_app.route("/api/ingest/activity/close", methods=["POST"])
+def ingest_activity_close():
+    err = _require_api_key()
+    if err: return err
+    d = request.get_json(force=True)
+    aid = d.get("activity_id")
+    if aid is None:
+        aid = _resolve_activity_id(d.get("activity_client_event_id"))
+    if aid is None:
+        return jsonify({"error": "activity not found"}), 404
+    _db.close_app_activity(activity_id=int(aid), end_time=d["end_time"])
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/ingest/todo/start", methods=["POST"])
+def ingest_todo_start():
+    err = _require_api_key()
+    if err: return err
+    d = request.get_json(force=True)
+    sid = _db.start_todo_timer(int(d["todo_id"]))
+    return jsonify({"todo_session_id": sid})
+
+
+@flask_app.route("/api/ingest/todo/stop", methods=["POST"])
+def ingest_todo_stop():
+    err = _require_api_key()
+    if err: return err
+    d = request.get_json(force=True)
+    _db.stop_todo_timer(int(d["todo_id"]), reason=d.get("reason", "manual"))
+    return jsonify({"ok": True})
+
+
+@flask_app.route("/api/ingest/todo/active", methods=["GET"])
+def ingest_todo_active():
+    err = _require_api_key()
+    if err: return err
+    row = _db.get_active_todo_session()
+    return jsonify({"active": row})
+
+
+@flask_app.route("/api/ingest/heartbeat", methods=["POST"])
+def ingest_heartbeat():
+    err = _require_api_key()
+    if err: return err
+    d = request.get_json(force=True) or {}
+    _last_heartbeat["time"] = datetime.now(timezone.utc).isoformat()
+    _last_heartbeat["device_id"] = d.get("device_id")
+    _last_heartbeat["state"] = d.get("state", "unknown")
+    _last_heartbeat["idle_seconds"] = d.get("idle_seconds", 0)
+    _last_heartbeat["excluded_app"] = d.get("excluded_app")
+    return jsonify({"ok": True})
 
 
 def _get_excluded_processes() -> set:

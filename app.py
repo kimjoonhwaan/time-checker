@@ -277,15 +277,37 @@ def get_config():
 
 def _serialize_todo(t: dict) -> dict:
     secs = t["total_seconds"] or 0
+    active_secs = 0
+    active_start = None
+    if t["status"] == "in_progress":
+        row = _db._conn.execute(
+            "SELECT start_time FROM todo_sessions "
+            "WHERE todo_id = ? AND end_time IS NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (t["id"],)
+        ).fetchone()
+        if row:
+            try:
+                start = datetime.fromisoformat(row["start_time"])
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=timezone.utc)
+                active_secs = max(0, int(
+                    (datetime.now(timezone.utc) - start).total_seconds()
+                ))
+                active_start = row["start_time"]
+            except Exception:
+                pass
+    total_with_active = secs + active_secs
     est = t.get("estimated_seconds")
-    pct = round(secs / est * 100) if est and est > 0 else None
+    pct = round(total_with_active / est * 100) if est and est > 0 else None
     return {
         "id": t["id"],
         "title": t["title"],
         "status": t["status"],
         "priority": t["priority"],
-        "total_seconds": secs,
-        "total_formatted": format_duration(secs),
+        "total_seconds": total_with_active,
+        "total_formatted": format_duration(total_with_active),
+        "active_session_start": active_start,
         "estimated_seconds": est,
         "progress_pct": pct,
         "notes": t.get("notes") or "",

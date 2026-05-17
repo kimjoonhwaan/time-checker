@@ -106,11 +106,11 @@ class TrackerLoop:
         threshold = self._config.get("idle_threshold_seconds", 60)
 
         if idle_secs >= threshold:
+            idle_start = datetime.now(timezone.utc) - timedelta(seconds=idle_secs)
             if self._state == TrackerState.TRACKING:
-                idle_start = datetime.now(timezone.utc) - timedelta(seconds=idle_secs)
                 self._end_session(end_time=idle_start)
             if self._state != TrackerState.IDLE:
-                self._auto_pause_active_todo("idle")
+                self._auto_pause_active_todo("idle", end_time_iso=idle_start.isoformat())
             self._state = TrackerState.IDLE
             self._excluded_app_name = None
             return
@@ -139,13 +139,16 @@ class TrackerLoop:
         elif window is not None:
             self._handle_window_change(window)
 
-    def _auto_pause_active_todo(self, reason: str = "idle"):
+    def _auto_pause_active_todo(self, reason: str = "idle", end_time_iso: Optional[str] = None):
         if self._auto_paused_todo_id:
             return
         try:
             active = self._db.get_active_todo_session()
             if active:
-                self._db.stop_todo_timer(active["todo_id"], reason=reason)
+                kwargs = {"reason": reason}
+                if end_time_iso:
+                    kwargs["end_time"] = end_time_iso
+                self._db.stop_todo_timer(active["todo_id"], **kwargs)
                 self._auto_paused_todo_id = active["todo_id"]
         except Exception:
             pass

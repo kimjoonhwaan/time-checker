@@ -1,6 +1,6 @@
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 class DatabaseManager:
@@ -53,6 +53,10 @@ class DatabaseManager:
             CREATE INDEX IF NOT EXISTS idx_app_activity_session ON app_activity(session_id);
             CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status);
             CREATE INDEX IF NOT EXISTS idx_todo_sessions_todo ON todo_sessions(todo_id);
+            CREATE TABLE IF NOT EXISTS device_heartbeats (
+                device_id TEXT PRIMARY KEY,
+                time      TEXT NOT NULL
+            );
         """)
         self._conn.commit()
 
@@ -351,15 +355,27 @@ class DatabaseManager:
             self._conn.commit()
             return cur.lastrowid
 
-    def stop_todo_timer(self, todo_id: int, reason: str = 'manual'):
-        now = datetime.now(timezone.utc).isoformat()
+    def stop_todo_timer(self, todo_id: int, reason: str = 'manual', end_time: str = None):
+        # If end_time is provided (e.g. backdated idle_start), honor it but
+        # never let it be before the active session's start_time.
         with self._lock:
             session = self._conn.execute(
-                "SELECT id FROM todo_sessions WHERE todo_id = ? AND end_time IS NULL",
+                "SELECT id, start_time FROM todo_sessions "
+                "WHERE todo_id = ? AND end_time IS NULL",
                 (todo_id,)
             ).fetchone()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            effective = end_time or now_iso
+            if session and end_time:
+                # Clamp: end >= start, end <= now
+                if effective < session["start_time"]:
+                    effective = session["start_time"]
+                if effective > now_iso:
+                    effective = now_iso
             if session:
-                self._close_todo_session_locked(session["id"], todo_id, now, reason)
+                self._close_todo_session_locked(
+                    session["id"], todo_id, effective, reason
+                )
             self._conn.execute(
                 "UPDATE todos SET status = 'paused' WHERE id = ? AND status = 'in_progress'",
                 (todo_id,)
@@ -448,6 +464,44 @@ class DatabaseManager:
         """, (f'-{months} months',))
         return [dict(row) for row in cur.fetchall()]
 
+    # Active sessions (OS or todo) keep accruing in "live elapsed" displays
+    # as (now - start_time). If the tracker crashes, that elapsed grows
+    # forever. We cap it using the most recent heartbeat: any active
+    # session can only accrue up to `last_heartbeat + this many seconds`.
+    _HEARTBEAT_GRACE_SECONDS = 60
+
+    def record_heartbeat(self, device_id: str, time_iso: str):
+        if not device_id:
+            return
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO device_heartbeats(device_id, time) VALUES(?, ?) "
+                "ON CONFLICT(device_id) DO UPDATE SET time = excluded.time",
+                (device_id, time_iso)
+            )
+            self._conn.commit()
+
+    def _live_cutoff(self) -> datetime:
+        """Returns the effective 'now' for live elapsed calculations.
+        - If most recent heartbeat is fresh (within grace), returns datetime.now().
+        - Else returns (last_heartbeat + grace), freezing elapsed at that moment.
+        - If no heartbeats yet, returns datetime.now() (fall back to old behavior)."""
+        now = datetime.now(timezone.utc)
+        row = self._conn.execute(
+            "SELECT MAX(time) AS x FROM device_heartbeats"
+        ).fetchone()
+        last = row["x"] if row else None
+        if not last:
+            return now
+        try:
+            last_dt = datetime.fromisoformat(last)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            grace_end = last_dt + timedelta(seconds=self._HEARTBEAT_GRACE_SECONDS)
+            return min(now, grace_end) if grace_end < now else now
+        except Exception:
+            return now
+
     def get_today_todo_total_seconds(self, date: str) -> int:
         """Sum of all time spent on todos today (UTC date).
 
@@ -472,7 +526,7 @@ class DatabaseManager:
                 if start.tzinfo is None:
                     start = start.replace(tzinfo=timezone.utc)
                 active = max(0, int(
-                    (datetime.now(timezone.utc) - start).total_seconds()
+                    (self._live_cutoff() - start).total_seconds()
                 ))
             except Exception:
                 pass

@@ -184,11 +184,11 @@ class IngestClient:
         resp = self._post("/api/ingest/todo/start", {"todo_id": int(todo_id)})
         return resp.get("todo_session_id") if resp else None
 
-    def stop_todo_timer(self, todo_id: int, reason: str = "manual"):
-        self._post("/api/ingest/todo/stop", {
-            "todo_id": int(todo_id),
-            "reason": reason,
-        })
+    def stop_todo_timer(self, todo_id: int, reason: str = "manual", end_time: str = None):
+        payload = {"todo_id": int(todo_id), "reason": reason}
+        if end_time:
+            payload["end_time"] = end_time
+        self._post("/api/ingest/todo/stop", payload)
 
     def get_today_total_seconds(self, date: str) -> int:
         resp = self._get("/api/summary/today")

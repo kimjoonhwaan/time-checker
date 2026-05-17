@@ -230,7 +230,10 @@ def ingest_todo_stop():
     err = _require_api_key()
     if err: return err
     d = request.get_json(force=True)
-    _db.stop_todo_timer(int(d["todo_id"]), reason=d.get("reason", "manual"))
+    kwargs = {"reason": d.get("reason", "manual")}
+    if d.get("end_time"):
+        kwargs["end_time"] = d["end_time"]
+    _db.stop_todo_timer(int(d["todo_id"]), **kwargs)
     return jsonify({"ok": True})
 
 
@@ -260,6 +263,7 @@ def ingest_heartbeat():
     _last_heartbeat["state"] = d.get("state", "unknown")
     _last_heartbeat["idle_seconds"] = d.get("idle_seconds", 0)
     _last_heartbeat["excluded_app"] = d.get("excluded_app")
+    _db.record_heartbeat(d.get("device_id"), _last_heartbeat["time"])
     return jsonify({"ok": True})
 
 
@@ -303,7 +307,7 @@ def _serialize_todo(t: dict) -> dict:
                 if start.tzinfo is None:
                     start = start.replace(tzinfo=timezone.utc)
                 active_secs = max(0, int(
-                    (datetime.now(timezone.utc) - start).total_seconds()
+                    (_db._live_cutoff() - start).total_seconds()
                 ))
                 active_start = row["start_time"]
             except Exception:

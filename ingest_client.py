@@ -1,20 +1,15 @@
-"""HTTP client for posting tracker measurements to a remote TimeChecker server.
+"""HTTP client used by the local tracker to send measurements to the server.
 
-Mirrors the subset of `DatabaseManager` that `TrackerLoop` calls, so it can be
-substituted in `main.py` without changing tracker code.
+Mirrors the subset of `DatabaseManager` that `TrackerLoop` calls so it can be
+plugged in interchangeably. Network failures don't lose data: failed POSTs
+are persisted to a local SQLite queue and replayed by a background worker.
 
-Network failures don't lose data: failed POSTs are persisted to a local SQLite
-queue and replayed by a background worker.
-
-Session/activity handles returned by `open_*` methods are **client UUIDs**
-(strings), not server-assigned integers. All subsequent calls reference these
-UUIDs via `session_client_event_id` / `activity_client_event_id`, so the
-tracker can keep working while offline.
+Activity rows are addressed by client-generated UUIDs so the tracker doesn't
+need to wait for server-assigned IDs.
 """
 import json
 import sqlite3
 import threading
-import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,10 +28,8 @@ class IngestClient:
         self._timeout = timeout
         self._retry_interval = retry_interval
         self._session = requests.Session()
-        self._lock = threading.Lock()
         self._queue_lock = threading.Lock()
-        self._cached_today_total = 0
-        self._cached_today_date: Optional[str] = None
+        self._cached_today_todo_total = 0
         self._cached_active_todo: Optional[dict] = None
 
         Path(queue_db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -66,17 +59,15 @@ class IngestClient:
         return h
 
     def _post(self, path: str, payload: dict, queue_on_fail: bool = True) -> Optional[dict]:
-        """Best-effort POST. Returns response JSON on success, None otherwise.
-        Queues the payload for retry on any network/HTTP error if queue_on_fail."""
-        url = self._base + path
         try:
-            r = self._session.post(url, json=payload, headers=self._headers(),
-                                   timeout=self._timeout)
+            r = self._session.post(self._base + path, json=payload,
+                                   headers=self._headers(), timeout=self._timeout)
             if r.status_code < 400:
                 return r.json() if r.content else {}
             if r.status_code == 401:
-                # Auth issue — don't queue, it'll never succeed.
-                return None
+                return None  # auth — won't ever succeed
+            if r.status_code < 500:
+                return None  # permanent client error — don't queue
         except requests.RequestException:
             pass
         if queue_on_fail:
@@ -84,10 +75,9 @@ class IngestClient:
         return None
 
     def _get(self, path: str, params: dict = None) -> Optional[dict]:
-        url = self._base + path
         try:
-            r = self._session.get(url, params=params, headers=self._headers(),
-                                  timeout=self._timeout)
+            r = self._session.get(self._base + path, params=params,
+                                  headers=self._headers(), timeout=self._timeout)
             if r.status_code < 400:
                 return r.json() if r.content else {}
         except requests.RequestException:
@@ -102,6 +92,11 @@ class IngestClient:
             )
             self._queue.commit()
 
+    def _delete_queued(self, row_id: int):
+        with self._queue_lock:
+            self._queue.execute("DELETE FROM pending_posts WHERE id = ?", (row_id,))
+            self._queue.commit()
+
     def _drain_loop(self):
         while not self._shutdown.is_set():
             self._drain_once()
@@ -114,51 +109,33 @@ class IngestClient:
             ).fetchall()
         for row_id, path, payload_json in rows:
             payload = json.loads(payload_json)
-            url = self._base + path
             try:
-                r = self._session.post(url, json=payload, headers=self._headers(),
-                                       timeout=self._timeout)
-                if r.status_code < 400:
-                    with self._queue_lock:
-                        self._queue.execute("DELETE FROM pending_posts WHERE id = ?", (row_id,))
-                        self._queue.commit()
-                elif r.status_code == 401:
-                    # Stop draining; auth needs to be fixed first.
-                    return
-                else:
-                    # Other 4xx/5xx — keep in queue for next round.
-                    return
+                r = self._session.post(self._base + path, json=payload,
+                                       headers=self._headers(), timeout=self._timeout)
             except requests.RequestException:
-                return  # network still down, stop draining
+                return  # network down — try whole queue next interval
+            if r.status_code < 400:
+                self._delete_queued(row_id)
+            elif r.status_code == 401:
+                return  # auth issue — entire queue stalls until fixed
+            elif r.status_code < 500:
+                # Permanent client error (404 stale ref, 400 bad payload, etc.).
+                # Drop the row so it doesn't block successors.
+                self._delete_queued(row_id)
+            else:
+                return  # 5xx — server may recover, retry whole queue next interval
 
-    # ── DatabaseManager-compatible surface ──────────────────────
+    # ── DatabaseManager-compatible surface (tracker uses these) ──
 
-    def open_session(self, start_time: str, date: str) -> str:
-        eid = str(uuid.uuid4())
-        self._post("/api/ingest/session/open", {
-            "client_event_id": eid,
-            "start_time": start_time,
-            "date": date,
-            "device_id": self._device_id,
-        })
-        return eid
-
-    def close_session(self, session_id, end_time: str):
-        # session_id here is the client UUID we returned from open_session.
-        self._post("/api/ingest/session/close", {
-            "session_client_event_id": session_id,
-            "end_time": end_time,
-        })
-
-    def open_app_activity(self, session_id, process_name: str,
-                          window_title: str, start_time: str) -> str:
+    def open_app_activity(self, process_name: str, window_title: str,
+                          start_time: str, todo_id: int = None) -> str:
         eid = str(uuid.uuid4())
         self._post("/api/ingest/activity/open", {
             "client_event_id": eid,
-            "session_client_event_id": session_id,
             "process_name": process_name,
             "window_title": window_title,
             "start_time": start_time,
+            "todo_id": todo_id,
             "device_id": self._device_id,
         })
         return eid
@@ -168,10 +145,6 @@ class IngestClient:
             "activity_client_event_id": activity_id,
             "end_time": end_time,
         })
-
-    def close_stale_sessions(self):
-        # Server-side concern — no-op for the client.
-        return
 
     def get_active_todo_session(self) -> Optional[dict]:
         resp = self._get("/api/ingest/todo/active")
@@ -190,19 +163,19 @@ class IngestClient:
         resp = self._post("/api/ingest/todo/start", {"todo_id": int(todo_id)})
         return resp.get("todo_session_id") if resp else None
 
-    def stop_todo_timer(self, todo_id: int, reason: str = "manual", end_time: str = None):
+    def stop_todo_timer(self, todo_id: int, reason: str = "manual",
+                        end_time: str = None):
         payload = {"todo_id": int(todo_id), "reason": reason}
         if end_time:
             payload["end_time"] = end_time
         self._post("/api/ingest/todo/stop", payload)
 
-    def get_today_total_seconds(self, date: str) -> int:
+    def get_today_todo_total_seconds(self, date: str) -> int:
         resp = self._get("/api/summary/today")
         if resp is None:
-            return self._cached_today_total
-        self._cached_today_total = resp.get("total_seconds", 0)
-        self._cached_today_date = date
-        return self._cached_today_total
+            return self._cached_today_todo_total
+        self._cached_today_todo_total = resp.get("todo_total_seconds", 0)
+        return self._cached_today_todo_total
 
     def heartbeat(self, state: str, idle_seconds: float, excluded_app: Optional[str]):
         self._post("/api/ingest/heartbeat", {
@@ -210,7 +183,7 @@ class IngestClient:
             "state": state,
             "idle_seconds": idle_seconds,
             "excluded_app": excluded_app,
-        }, queue_on_fail=False)  # heartbeats are ephemeral, don't queue stale ones
+        }, queue_on_fail=False)
 
     def close(self):
         self._shutdown.set()

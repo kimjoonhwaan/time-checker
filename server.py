@@ -28,7 +28,7 @@ def _load_server_config() -> dict:
 
 config = _load_server_config()
 db = DatabaseManager(str(paths.server_db_path(config)))
-db.close_stale_sessions()
+db.cleanup_orphan_todo_sessions()
 init_app(
     db,
     tracker=None,

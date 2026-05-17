@@ -1,9 +1,28 @@
+"""SQLite-backed store for TimeChecker.
+
+After the simplification we keep only two real measurement tables:
+
+  app_activity  — per-window foreground intervals (drives "앱별 사용 시간")
+  todo_sessions — start/stop intervals per todo  (drives "오늘 작업 시간")
+
+`sessions` is preserved for older rows but no longer written or read; it
+exists only so prior data isn't lost.
+
+The tracker owns a single state machine and is the only writer of activity
+and todo_session rows, so we don't need separate liveness/cap logic for
+two parallel systems.
+"""
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 
 
 class DatabaseManager:
+    # Active todo session elapsed time is capped relative to the most recent
+    # heartbeat from any device. If the tracker dies, the displayed counter
+    # freezes within this grace window instead of growing forever.
+    _HEARTBEAT_GRACE_SECONDS = 60
+
     def __init__(self, db_path: str):
         self._db_path = db_path
         self._lock = threading.Lock()
@@ -15,21 +34,16 @@ class DatabaseManager:
 
     def _create_tables(self):
         self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                start_time     TEXT NOT NULL,
-                end_time       TEXT,
-                total_seconds  INTEGER,
-                date           TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS app_activity (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id       INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
                 process_name     TEXT NOT NULL,
                 window_title     TEXT,
                 start_time       TEXT NOT NULL,
                 end_time         TEXT,
-                duration_seconds INTEGER
+                duration_seconds INTEGER,
+                todo_id          INTEGER,
+                device_id        TEXT,
+                client_event_id  TEXT
             );
             CREATE TABLE IF NOT EXISTS todos (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,29 +61,30 @@ class DatabaseManager:
                 todo_id          INTEGER REFERENCES todos(id) ON DELETE CASCADE,
                 start_time       TEXT NOT NULL,
                 end_time         TEXT,
-                duration_seconds INTEGER
+                duration_seconds INTEGER,
+                pause_reason     TEXT,
+                device_id        TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_sessions_date ON sessions(date);
-            CREATE INDEX IF NOT EXISTS idx_app_activity_session ON app_activity(session_id);
-            CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status);
-            CREATE INDEX IF NOT EXISTS idx_todo_sessions_todo ON todo_sessions(todo_id);
             CREATE TABLE IF NOT EXISTS device_heartbeats (
                 device_id TEXT PRIMARY KEY,
                 time      TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_app_activity_start ON app_activity(start_time);
+            CREATE INDEX IF NOT EXISTS idx_todos_status       ON todos(status);
+            CREATE INDEX IF NOT EXISTS idx_todo_sessions_todo ON todo_sessions(todo_id);
+            CREATE INDEX IF NOT EXISTS idx_todo_sessions_start ON todo_sessions(start_time);
         """)
         self._conn.commit()
 
     def _migrate(self):
+        # Add columns on pre-existing DBs from older versions. Each silently
+        # no-ops if the column is already present.
         migrations = [
-            "ALTER TABLE todo_sessions ADD COLUMN pause_reason TEXT",
-            "ALTER TABLE sessions ADD COLUMN device_id TEXT",
-            "ALTER TABLE sessions ADD COLUMN client_event_id TEXT",
+            "ALTER TABLE app_activity ADD COLUMN todo_id INTEGER",
             "ALTER TABLE app_activity ADD COLUMN device_id TEXT",
             "ALTER TABLE app_activity ADD COLUMN client_event_id TEXT",
-            "ALTER TABLE todos ADD COLUMN device_id TEXT",
+            "ALTER TABLE todo_sessions ADD COLUMN pause_reason TEXT",
             "ALTER TABLE todo_sessions ADD COLUMN device_id TEXT",
-            "ALTER TABLE todo_sessions ADD COLUMN client_event_id TEXT",
         ]
         for sql in migrations:
             try:
@@ -78,49 +93,21 @@ class DatabaseManager:
                 pass
         try:
             self._conn.executescript("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_client_event
-                    ON sessions(client_event_id) WHERE client_event_id IS NOT NULL;
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_activity_client_event
                     ON app_activity(client_event_id) WHERE client_event_id IS NOT NULL;
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_todo_sessions_client_event
-                    ON todo_sessions(client_event_id) WHERE client_event_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_app_activity_todo
+                    ON app_activity(todo_id);
             """)
         except Exception:
             pass
         self._conn.commit()
 
-    def open_session(self, start_time: str, date: str,
-                     device_id: str = None, client_event_id: str = None) -> int:
-        with self._lock:
-            if client_event_id:
-                row = self._conn.execute(
-                    "SELECT id FROM sessions WHERE client_event_id = ?", (client_event_id,)
-                ).fetchone()
-                if row:
-                    return row["id"]
-            cur = self._conn.execute(
-                "INSERT INTO sessions (start_time, date, device_id, client_event_id) "
-                "VALUES (?, ?, ?, ?)",
-                (start_time, date, device_id, client_event_id)
-            )
-            self._conn.commit()
-            return cur.lastrowid
+    # ── App activity (per-window intervals) ─────────────────────
 
-    def close_session(self, session_id: int, end_time: str):
-        with self._lock:
-            self._conn.execute("""
-                UPDATE sessions
-                SET end_time = ?,
-                    total_seconds = CAST(
-                        ROUND((julianday(?) - julianday(start_time)) * 86400) AS INTEGER
-                    )
-                WHERE id = ?
-            """, (end_time, end_time, session_id))
-            self._conn.commit()
-
-    def open_app_activity(self, session_id: int, process_name: str,
-                          window_title: str, start_time: str,
-                          device_id: str = None, client_event_id: str = None) -> int:
+    def open_app_activity(self, process_name: str, window_title: str,
+                          start_time: str, todo_id: int = None,
+                          device_id: str = None,
+                          client_event_id: str = None) -> int:
         with self._lock:
             if client_event_id:
                 row = self._conn.execute(
@@ -131,11 +118,11 @@ class DatabaseManager:
                     return row["id"]
             cur = self._conn.execute(
                 """INSERT INTO app_activity
-                       (session_id, process_name, window_title, start_time,
-                        device_id, client_event_id)
+                       (process_name, window_title, start_time,
+                        todo_id, device_id, client_event_id)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                (session_id, process_name, window_title, start_time,
-                 device_id, client_event_id)
+                (process_name, window_title, start_time,
+                 todo_id, device_id, client_event_id)
             )
             self._conn.commit()
             return cur.lastrowid
@@ -145,139 +132,25 @@ class DatabaseManager:
             self._conn.execute("""
                 UPDATE app_activity
                 SET end_time = ?,
-                    duration_seconds = CAST(
+                    duration_seconds = MAX(0, CAST(
                         ROUND((julianday(?) - julianday(start_time)) * 86400) AS INTEGER
-                    )
-                WHERE id = ?
+                    ))
+                WHERE id = ? AND end_time IS NULL
             """, (end_time, end_time, activity_id))
             self._conn.commit()
 
-    def close_stale_sessions(self):
-        with self._lock:
-            now = datetime.now(timezone.utc).isoformat()
-            self._conn.execute("""
-                UPDATE sessions SET end_time = start_time, total_seconds = 0
-                WHERE end_time IS NULL
-            """)
-            self._conn.execute("""
-                UPDATE app_activity SET end_time = start_time, duration_seconds = 0
-                WHERE end_time IS NULL
-            """)
-            self._conn.commit()
-
-    # An open session is treated as "live" only if (a) it is the most recently
-    # opened session for the day (older open sessions are crash leftovers,
-    # contribute 0) and (b) it hasn't been open for more than this many seconds
-    # (safety cap if tracker is dead but stays open). Tracker normally closes
-    # the session on idle/excluded transitions; long uninterrupted work is OK.
-    _STALE_OPEN_SECONDS = 14400  # 4 hours
-
-    def get_today_total_seconds(self, date: str) -> int:
-        cur = self._conn.execute(f"""
-            WITH live AS (
-                SELECT MAX(id) AS id FROM sessions
-                WHERE end_time IS NULL AND date = ?
-            )
-            SELECT COALESCE(SUM(
-                CASE
-                    WHEN s.end_time IS NOT NULL THEN s.total_seconds
-                    WHEN s.id = (SELECT id FROM live)
-                         AND (julianday('now') - julianday(s.start_time)) * 86400 < {self._STALE_OPEN_SECONDS}
-                        THEN CAST(ROUND((julianday('now') - julianday(s.start_time)) * 86400) AS INTEGER)
-                    ELSE 0
-                END
-            ), 0)
-            FROM sessions s WHERE s.date = ?
-        """, (date, date))
-        return cur.fetchone()[0]
-
-    def cleanup_stale_open_sessions(self) -> dict:
-        """Close sessions that have been open longer than _STALE_OPEN_SECONDS.
-
-        For each stale open session, sets end_time to MAX(start_time, last
-        child app_activity end_time) so any genuinely measured time isn't lost.
-        Also closes any orphan app_activity rows that lost their parent.
-
-        Returns a small report.
-        """
-        with self._lock:
-            stale = self._conn.execute(f"""
-                SELECT id, start_time FROM sessions
-                WHERE end_time IS NULL
-                  AND (julianday('now') - julianday(start_time)) * 86400 >= {self._STALE_OPEN_SECONDS}
-            """).fetchall()
-
-            closed_sessions = 0
-            closed_activities = 0
-            for row in stale:
-                sid = row["id"]
-                start_time = row["start_time"]
-                # Find latest activity end_time for this session as best-guess end.
-                last_end = self._conn.execute(
-                    "SELECT MAX(end_time) AS x FROM app_activity "
-                    "WHERE session_id = ? AND end_time IS NOT NULL",
-                    (sid,)
-                ).fetchone()["x"]
-                end_time = last_end if last_end else start_time
-                # Close any still-open activities under this session first.
-                orphan_acts = self._conn.execute(
-                    "SELECT id FROM app_activity "
-                    "WHERE session_id = ? AND end_time IS NULL", (sid,)
-                ).fetchall()
-                for a in orphan_acts:
-                    self._conn.execute("""
-                        UPDATE app_activity
-                        SET end_time = ?,
-                            duration_seconds = CAST(
-                                ROUND((julianday(?) - julianday(start_time)) * 86400) AS INTEGER
-                            )
-                        WHERE id = ?
-                    """, (end_time, end_time, a["id"]))
-                    closed_activities += 1
-                self._conn.execute("""
-                    UPDATE sessions
-                    SET end_time = ?,
-                        total_seconds = CAST(
-                            ROUND((julianday(?) - julianday(start_time)) * 86400) AS INTEGER
-                        )
-                    WHERE id = ?
-                """, (end_time, end_time, sid))
-                closed_sessions += 1
-            self._conn.commit()
-            return {
-                "closed_sessions": closed_sessions,
-                "closed_activities": closed_activities,
-            }
-
-    def get_sessions_for_date(self, date: str) -> list:
-        cur = self._conn.execute(
-            "SELECT id, start_time, end_time, total_seconds FROM sessions WHERE date = ? AND end_time IS NOT NULL ORDER BY start_time",
-            (date,)
-        )
-        return [dict(row) for row in cur.fetchall()]
-
-    def get_app_breakdown(self, date: str) -> list:
+    def get_app_breakdown(self, date_utc: str) -> list:
         cur = self._conn.execute("""
-            SELECT a.process_name, SUM(a.duration_seconds) as total_seconds
-            FROM app_activity a
-            JOIN sessions s ON a.session_id = s.id
-            WHERE s.date = ? AND a.duration_seconds IS NOT NULL
-            GROUP BY a.process_name
+            SELECT process_name, SUM(duration_seconds) AS total_seconds
+            FROM app_activity
+            WHERE substr(start_time, 1, 10) = ?
+              AND duration_seconds IS NOT NULL
+            GROUP BY process_name
             ORDER BY total_seconds DESC
-        """, (date,))
+        """, (date_utc,))
         return [dict(row) for row in cur.fetchall()]
 
-    def get_weekly_summary(self, start_date: str, end_date: str) -> list:
-        cur = self._conn.execute("""
-            SELECT date, COALESCE(SUM(total_seconds), 0) as total_seconds
-            FROM sessions
-            WHERE date BETWEEN ? AND ? AND end_time IS NOT NULL
-            GROUP BY date
-            ORDER BY date
-        """, (start_date, end_date))
-        return [dict(row) for row in cur.fetchall()]
-
-    # ── Todo CRUD ────────────────────────────────────────────────
+    # ── Todos ───────────────────────────────────────────────────
 
     def create_todo(self, title: str, priority: str = "medium",
                     estimated_seconds: int = None, notes: str = None) -> int:
@@ -299,7 +172,9 @@ class DatabaseManager:
             )
         else:
             cur = self._conn.execute(
-                "SELECT * FROM todos ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'todo' THEN 1 WHEN 'paused' THEN 2 ELSE 3 END, created_at DESC"
+                "SELECT * FROM todos ORDER BY "
+                "CASE status WHEN 'in_progress' THEN 0 WHEN 'todo' THEN 1 "
+                "WHEN 'paused' THEN 2 ELSE 3 END, created_at DESC"
             )
         return [dict(row) for row in cur.fetchall()]
 
@@ -326,12 +201,20 @@ class DatabaseManager:
             self._conn.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
             self._conn.commit()
 
+    def get_active_todo_session(self) -> dict:
+        cur = self._conn.execute(
+            """SELECT ts.*, t.title FROM todo_sessions ts
+               JOIN todos t ON ts.todo_id = t.id
+               WHERE ts.end_time IS NULL LIMIT 1"""
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
     def get_recently_auto_paused_todo(self, within_seconds: int = 3600) -> dict:
         """Most recently paused todo whose last todo_session was closed by
-        the tracker (reason 'idle' or 'excluded:*'). Used by the tracker as a
-        fallback to resume after a state IDLE→TRACKING transition when its
-        in-memory _auto_paused_todo_id is missing (e.g. restart)."""
-        cur = self._conn.execute(f"""
+        the tracker (reason 'idle' or 'excluded:*'). Tracker queries this on
+        TRACKING transition to know what to resume."""
+        cur = self._conn.execute("""
             SELECT t.id AS todo_id, t.title, ts.end_time, ts.pause_reason
             FROM todos t
             JOIN todo_sessions ts ON ts.todo_id = t.id
@@ -346,38 +229,32 @@ class DatabaseManager:
         row = cur.fetchone()
         return dict(row) if row else None
 
-    def get_active_todo_session(self) -> dict:
-        cur = self._conn.execute(
-            """SELECT ts.*, t.title FROM todo_sessions ts
-               JOIN todos t ON ts.todo_id = t.id
-               WHERE ts.end_time IS NULL LIMIT 1"""
-        )
-        row = cur.fetchone()
-        return dict(row) if row else None
-
     def start_todo_timer(self, todo_id: int) -> int:
-        now = datetime.now(timezone.utc).isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            # Auto-pause any currently running todo
+            # Auto-pause any currently open todo using a heartbeat-aware end.
             active = self._conn.execute(
-                "SELECT ts.id, ts.todo_id FROM todo_sessions ts WHERE ts.end_time IS NULL LIMIT 1"
+                "SELECT id, todo_id, start_time FROM todo_sessions "
+                "WHERE end_time IS NULL LIMIT 1"
             ).fetchone()
             if active:
-                self._close_todo_session_locked(active["id"], active["todo_id"], now)
-
+                cutoff = self._live_cutoff_iso_unlocked()
+                end = max(active["start_time"], min(cutoff, now_iso))
+                self._close_todo_session_locked(
+                    active["id"], active["todo_id"], end, "interrupted"
+                )
             self._conn.execute(
                 "UPDATE todos SET status = 'in_progress' WHERE id = ?", (todo_id,)
             )
             cur = self._conn.execute(
                 "INSERT INTO todo_sessions (todo_id, start_time) VALUES (?, ?)",
-                (todo_id, now)
+                (todo_id, now_iso)
             )
             self._conn.commit()
             return cur.lastrowid
 
-    def stop_todo_timer(self, todo_id: int, reason: str = 'manual', end_time: str = None):
-        # If end_time is provided (e.g. backdated idle_start), honor it but
-        # never let it be before the active session's start_time.
+    def stop_todo_timer(self, todo_id: int, reason: str = 'manual',
+                        end_time: str = None):
         with self._lock:
             session = self._conn.execute(
                 "SELECT id, start_time FROM todo_sessions "
@@ -386,18 +263,18 @@ class DatabaseManager:
             ).fetchone()
             now_iso = datetime.now(timezone.utc).isoformat()
             effective = end_time or now_iso
-            if session and end_time:
+            if session:
                 # Clamp: end >= start, end <= now
                 if effective < session["start_time"]:
                     effective = session["start_time"]
                 if effective > now_iso:
                     effective = now_iso
-            if session:
                 self._close_todo_session_locked(
                     session["id"], todo_id, effective, reason
                 )
             self._conn.execute(
-                "UPDATE todos SET status = 'paused' WHERE id = ? AND status = 'in_progress'",
+                "UPDATE todos SET status = 'paused' "
+                "WHERE id = ? AND status = 'in_progress'",
                 (todo_id,)
             )
             self._conn.commit()
@@ -406,7 +283,8 @@ class DatabaseManager:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             session = self._conn.execute(
-                "SELECT id FROM todo_sessions WHERE todo_id = ? AND end_time IS NULL",
+                "SELECT id FROM todo_sessions "
+                "WHERE todo_id = ? AND end_time IS NULL",
                 (todo_id,)
             ).fetchone()
             if session:
@@ -422,9 +300,9 @@ class DatabaseManager:
         self._conn.execute("""
             UPDATE todo_sessions
             SET end_time = ?,
-                duration_seconds = CAST(
+                duration_seconds = MAX(0, CAST(
                     ROUND((julianday(?) - julianday(start_time)) * 86400) AS INTEGER
-                ),
+                )),
                 pause_reason = ?
             WHERE id = ?
         """, (end_time, end_time, reason, session_id))
@@ -443,102 +321,23 @@ class DatabaseManager:
         """, (todo_id,))
         return [dict(row) for row in cur.fetchall()]
 
-    def get_daily_summary(self, days: int = 14) -> list:
-        cur = self._conn.execute(f"""
-            WITH live_per_day AS (
-                SELECT date, MAX(id) AS id FROM sessions
-                WHERE end_time IS NULL GROUP BY date
-            )
-            SELECT s.date, COALESCE(SUM(
-                CASE
-                    WHEN s.end_time IS NOT NULL THEN s.total_seconds
-                    WHEN s.id = (SELECT id FROM live_per_day WHERE date = s.date)
-                         AND (julianday('now') - julianday(s.start_time)) * 86400 < {self._STALE_OPEN_SECONDS}
-                        THEN CAST(ROUND((julianday('now') - julianday(s.start_time)) * 86400) AS INTEGER)
-                    ELSE 0
-                END
-            ), 0) AS total_seconds
-            FROM sessions s
-            WHERE s.date >= date('now', ?)
-            GROUP BY s.date ORDER BY s.date
-        """, (f'-{days - 1} days',))
-        return [dict(row) for row in cur.fetchall()]
+    # ── Today / summary queries (all UTC, todo-driven) ──────────
 
-    def get_weekly_totals(self, weeks: int = 8) -> list:
-        cur = self._conn.execute("""
-            SELECT strftime('%Y-%W', date) as week,
-                   COALESCE(SUM(total_seconds), 0) as total_seconds
-            FROM sessions
-            WHERE date >= date('now', ?) AND end_time IS NOT NULL
-            GROUP BY week ORDER BY week
-        """, (f'-{weeks * 7} days',))
-        return [dict(row) for row in cur.fetchall()]
-
-    def get_monthly_totals(self, months: int = 6) -> list:
-        cur = self._conn.execute("""
-            SELECT strftime('%Y-%m', date) as month,
-                   COALESCE(SUM(total_seconds), 0) as total_seconds
-            FROM sessions
-            WHERE date >= date('now', ?) AND end_time IS NOT NULL
-            GROUP BY month ORDER BY month
-        """, (f'-{months} months',))
-        return [dict(row) for row in cur.fetchall()]
-
-    # Active sessions (OS or todo) keep accruing in "live elapsed" displays
-    # as (now - start_time). If the tracker crashes, that elapsed grows
-    # forever. We cap it using the most recent heartbeat: any active
-    # session can only accrue up to `last_heartbeat + this many seconds`.
-    _HEARTBEAT_GRACE_SECONDS = 60
-
-    def record_heartbeat(self, device_id: str, time_iso: str):
-        if not device_id:
-            return
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO device_heartbeats(device_id, time) VALUES(?, ?) "
-                "ON CONFLICT(device_id) DO UPDATE SET time = excluded.time",
-                (device_id, time_iso)
-            )
-            self._conn.commit()
-
-    def _live_cutoff(self) -> datetime:
-        """Returns the effective 'now' for live elapsed calculations.
-        - If most recent heartbeat is fresh (within grace), returns datetime.now().
-        - Else returns (last_heartbeat + grace), freezing elapsed at that moment.
-        - If no heartbeats yet, returns datetime.now() (fall back to old behavior)."""
-        now = datetime.now(timezone.utc)
-        row = self._conn.execute(
-            "SELECT MAX(time) AS x FROM device_heartbeats"
-        ).fetchone()
-        last = row["x"] if row else None
-        if not last:
-            return now
-        try:
-            last_dt = datetime.fromisoformat(last)
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=timezone.utc)
-            grace_end = last_dt + timedelta(seconds=self._HEARTBEAT_GRACE_SECONDS)
-            return min(now, grace_end) if grace_end < now else now
-        except Exception:
-            return now
-
-    def get_today_todo_total_seconds(self, date: str) -> int:
-        """Sum of all time spent on todos today (UTC date).
-
-        Includes any currently in-progress todo's elapsed time since
-        its session started, so the dashboard counter ticks live.
-        """
+    def get_today_todo_total_seconds(self, date_utc: str) -> int:
+        """Sum of todo session time today, plus live elapsed of any active
+        session whose start_time falls on today."""
         closed = self._conn.execute("""
             SELECT COALESCE(SUM(duration_seconds), 0)
             FROM todo_sessions
             WHERE end_time IS NOT NULL
               AND substr(start_time, 1, 10) = ?
-        """, (date,)).fetchone()[0]
+        """, (date_utc,)).fetchone()[0]
         row = self._conn.execute("""
             SELECT start_time FROM todo_sessions
             WHERE end_time IS NULL
+              AND substr(start_time, 1, 10) = ?
             ORDER BY id DESC LIMIT 1
-        """).fetchone()
+        """, (date_utc,)).fetchone()
         active = 0
         if row:
             try:
@@ -552,12 +351,130 @@ class DatabaseManager:
                 pass
         return closed + active
 
-    def get_completed_today_count(self, date: str) -> int:
+    def get_completed_today_count(self, date_utc: str) -> int:
         cur = self._conn.execute(
-            "SELECT COUNT(*) FROM todos WHERE status = 'done' AND DATE(completed_at) = ?",
-            (date,)
+            "SELECT COUNT(*) FROM todos "
+            "WHERE status = 'done' AND substr(completed_at, 1, 10) = ?",
+            (date_utc,)
         )
         return cur.fetchone()[0]
+
+    def get_daily_todo_summary(self, days: int = 14) -> list:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        cur = self._conn.execute("""
+            SELECT substr(start_time, 1, 10) AS date,
+                   COALESCE(SUM(duration_seconds), 0) AS total_seconds
+            FROM todo_sessions
+            WHERE end_time IS NOT NULL
+              AND substr(start_time, 1, 10) >= ?
+            GROUP BY date ORDER BY date
+        """, (cutoff,))
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_weekly_todo_totals(self, weeks: int = 8) -> list:
+        cutoff = (datetime.now(timezone.utc) - timedelta(weeks=weeks)).strftime("%Y-%m-%d")
+        cur = self._conn.execute("""
+            SELECT strftime('%Y-%W', substr(start_time, 1, 10)) AS week,
+                   COALESCE(SUM(duration_seconds), 0) AS total_seconds
+            FROM todo_sessions
+            WHERE end_time IS NOT NULL
+              AND substr(start_time, 1, 10) >= ?
+            GROUP BY week ORDER BY week
+        """, (cutoff,))
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_monthly_todo_totals(self, months: int = 6) -> list:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=months * 31)).strftime("%Y-%m-%d")
+        cur = self._conn.execute("""
+            SELECT strftime('%Y-%m', substr(start_time, 1, 10)) AS month,
+                   COALESCE(SUM(duration_seconds), 0) AS total_seconds
+            FROM todo_sessions
+            WHERE end_time IS NOT NULL
+              AND substr(start_time, 1, 10) >= ?
+            GROUP BY month ORDER BY month
+        """, (cutoff,))
+        return [dict(row) for row in cur.fetchall()]
+
+    # ── Heartbeat / live cutoff ─────────────────────────────────
+
+    def record_heartbeat(self, device_id: str, time_iso: str):
+        if not device_id:
+            return
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO device_heartbeats(device_id, time) VALUES(?, ?) "
+                "ON CONFLICT(device_id) DO UPDATE SET time = excluded.time",
+                (device_id, time_iso)
+            )
+            self._conn.commit()
+
+    def _live_cutoff(self) -> datetime:
+        """Effective 'now' for active-session elapsed displays. If the most
+        recent heartbeat is within the grace window, use real now; otherwise
+        freeze at (last_heartbeat + grace) so abandoned sessions stop growing."""
+        now = datetime.now(timezone.utc)
+        row = self._conn.execute(
+            "SELECT MAX(time) AS x FROM device_heartbeats"
+        ).fetchone()
+        last = row["x"] if row else None
+        if not last:
+            return now
+        try:
+            last_dt = datetime.fromisoformat(last)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            grace_end = last_dt + timedelta(seconds=self._HEARTBEAT_GRACE_SECONDS)
+            return grace_end if grace_end < now else now
+        except Exception:
+            return now
+
+    def _live_cutoff_iso_unlocked(self) -> str:
+        """Same as _live_cutoff().isoformat() but safe to call while
+        self._lock is already held."""
+        return self._live_cutoff().isoformat()
+
+    # ── Cleanup ─────────────────────────────────────────────────
+
+    def cleanup_orphan_todo_sessions(self, stale_seconds: int = 14400) -> dict:
+        """Close any todo_session that's been open longer than stale_seconds
+        using the heartbeat cutoff as end_time. Mark its todo paused.
+        Returns a small report."""
+        with self._lock:
+            cutoff_iso = self._live_cutoff_iso_unlocked()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            stale = self._conn.execute(f"""
+                SELECT id, todo_id, start_time FROM todo_sessions
+                WHERE end_time IS NULL
+                  AND (julianday('now') - julianday(start_time)) * 86400 >= {stale_seconds}
+            """).fetchall()
+            closed = 0
+            for r in stale:
+                end = max(r["start_time"], min(cutoff_iso, now_iso))
+                self._close_todo_session_locked(
+                    r["id"], r["todo_id"], end, "abandoned"
+                )
+                self._conn.execute(
+                    "UPDATE todos SET status='paused' "
+                    "WHERE id=? AND status='in_progress'",
+                    (r["todo_id"],)
+                )
+                closed += 1
+            # Also close any app_activity rows older than the cap.
+            self._conn.execute(f"""
+                UPDATE app_activity
+                SET end_time = ?,
+                    duration_seconds = MAX(0, CAST(
+                        ROUND((julianday(?) - julianday(start_time)) * 86400) AS INTEGER
+                    ))
+                WHERE end_time IS NULL
+                  AND (julianday('now') - julianday(start_time)) * 86400 >= {stale_seconds}
+            """, (cutoff_iso, cutoff_iso))
+            closed_activities = self._conn.total_changes
+            self._conn.commit()
+            return {
+                "closed_todo_sessions": closed,
+                "closed_activities_estimate": closed_activities,
+            }
 
     def close(self):
         self._conn.close()

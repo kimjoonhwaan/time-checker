@@ -15,8 +15,6 @@ import os
 import socket
 import threading
 import uuid
-from datetime import datetime, timezone
-from pathlib import Path
 
 import paths
 from tracker import TrackerLoop
@@ -85,86 +83,54 @@ def main():
     pause_event = threading.Event()
 
     if server_url:
-        # ── REMOTE mode ─────────────────────────────────────────
         from ingest_client import IngestClient
-        client = IngestClient(
+        backend = IngestClient(
             server_url=server_url,
             api_key=api_key,
             queue_db_path=str(paths.client_queue_db_path(config)),
             device_id=device_id,
         )
-        backend = client
         flask_thread = None
         dashboard_url = server_url
     else:
-        # ── LOCAL mode ──────────────────────────────────────────
         from database import DatabaseManager
         from app import run_flask
-        db = DatabaseManager(str(paths.server_db_path(config)))
-        db.close_stale_sessions()
-        backend = db
+        backend = DatabaseManager(str(paths.server_db_path(config)))
+        backend.cleanup_orphan_todo_sessions()  # tidy on startup
         flask_thread = threading.Thread(
-            target=run_flask, args=(db, None, config, shutdown_event),
+            target=run_flask, args=(backend, None, config, shutdown_event),
             daemon=True, name="flask"
         )
-        dashboard_url = None  # tray will compute from config
+        dashboard_url = None
 
     tracker = TrackerLoop(backend, config, shutdown_event, pause_event)
-
-    # Resume hint: if previous shutdown was recent, backdate the next session
-    # so the gap counts as continuous activity.
-    marker = paths.shutdown_marker_path(config)
-    if marker.exists():
-        try:
-            saved = json.loads(marker.read_text())
-            last = datetime.fromisoformat(saved["time"])
-            if last.tzinfo is None:
-                last = last.replace(tzinfo=timezone.utc)
-            gap = (datetime.now(timezone.utc) - last).total_seconds()
-            if 0 < gap < 300:
-                tracker.set_resume_start_time(last.isoformat())
-        except Exception:
-            pass
-
     tracker_thread = threading.Thread(target=tracker.run, daemon=True, name="tracker")
     tracker_thread.start()
 
-    heartbeat_thread = None
     if server_url:
-        # Late start so tracker.get_status() works
-        heartbeat_thread = threading.Thread(
+        threading.Thread(
             target=_run_heartbeat, args=(backend, tracker, shutdown_event),
             daemon=True, name="heartbeat"
-        )
-        heartbeat_thread.start()
+        ).start()
 
     if flask_thread is not None:
         flask_thread.start()
 
-    # TrayApp signature accepts (tracker, _unused, config, shutdown, pause, dashboard_url=None)
     tray = TrayApp(tracker, None, config, shutdown_event, pause_event,
                    dashboard_url=dashboard_url)
     tray.run()  # blocks — owns main thread
 
-    # Shutdown cleanup — close any in-flight session BEFORE the backend
-    # (so the close_session POST goes into the queue / DB), then write a
-    # marker so the next launch can backdate the gap.
+    # Tray exited → shutdown_event is set. Serialize cleanup:
+    # 1. wait for last tracker tick to finish (so we don't race close())
+    # 2. force-close any open activity / todo
+    # 3. close backend (drains queue / closes sqlite)
+    tracker_thread.join(timeout=5)
     try:
         tracker.close_active_session()
     except Exception:
         pass
     try:
-        paths.shutdown_marker_path(config).write_text(json.dumps({
-            "time": datetime.now(timezone.utc).isoformat()
-        }))
-    except Exception:
-        pass
-    try:
-        if not server_url:
-            backend.close_stale_sessions()
-            backend.close()
-        else:
-            backend.close()
+        backend.close()
     except Exception:
         pass
 

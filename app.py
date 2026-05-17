@@ -1,3 +1,9 @@
+"""Flask API + dashboard for TimeChecker.
+
+All "today" boundaries are UTC; the dashboard displays everything in the
+browser's local timezone. The simplified model removed OS-session endpoints
+and the redundant total fields — only todo time + app breakdown are exposed.
+"""
 import json
 import os
 import socket
@@ -30,8 +36,12 @@ def init_app(db, tracker=None, config_path: Path = None, api_key: str = None):
         _api_key = os.environ.get("TIMECHECKER_API_KEY")
 
 
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 def format_duration(seconds: int) -> str:
-    h, rem = divmod(seconds, 3600)
+    h, rem = divmod(int(seconds), 3600)
     m, s = divmod(rem, 60)
     if h:
         return f"{h}h {m:02d}m {s:02d}s"
@@ -47,42 +57,18 @@ def dashboard():
 
 @flask_app.route("/api/summary/today")
 def summary_today():
-    date = datetime.now().strftime("%Y-%m-%d")
-    total = _db.get_today_total_seconds(date)
+    date = _today_utc()
     todo_total = _db.get_today_todo_total_seconds(date)
-    sessions = _db.get_sessions_for_date(date)
     return jsonify({
         "date": date,
-        "total_seconds": total,
-        "total_formatted": format_duration(total),
         "todo_total_seconds": todo_total,
         "todo_total_formatted": format_duration(todo_total),
-        "sessions": sessions
-    })
-
-
-@flask_app.route("/api/summary/week")
-def summary_week():
-    today = datetime.now()
-    start = (today - timedelta(days=6)).strftime("%Y-%m-%d")
-    end = today.strftime("%Y-%m-%d")
-    rows = _db.get_weekly_summary(start, end)
-    # Fill in days with 0 if missing
-    all_days = {}
-    for i in range(7):
-        d = (today - timedelta(days=6 - i)).strftime("%Y-%m-%d")
-        all_days[d] = 0
-    for row in rows:
-        all_days[row["date"]] = row["total_seconds"]
-    return jsonify({
-        "days": [{"date": d, "total_seconds": s, "formatted": format_duration(s)}
-                 for d, s in all_days.items()]
     })
 
 
 @flask_app.route("/api/apps/today")
 def apps_today():
-    date = datetime.now().strftime("%Y-%m-%d")
+    date = _today_utc()
     rows = _db.get_app_breakdown(date)
     total = sum(r["total_seconds"] for r in rows)
     excluded_processes = _get_excluded_processes()
@@ -101,9 +87,12 @@ def apps_today():
 
 @flask_app.route("/api/tracker/status")
 def tracker_status():
+    # In remote-server mode the tracker lives on a different machine, so we
+    # derive state from the last heartbeat. Local-mode (no remote) uses the
+    # tracker instance directly.
     if _tracker is None:
-        date = datetime.now().strftime("%Y-%m-%d")
-        total = _db.get_today_total_seconds(date) if _db else 0
+        date = _today_utc()
+        todo_total = _db.get_today_todo_total_seconds(date) if _db else 0
         last_hb = _last_heartbeat.get("time")
         stale = True
         if last_hb:
@@ -117,7 +106,7 @@ def tracker_status():
         state = "offline" if stale else _last_heartbeat.get("state", "unknown")
         return jsonify({
             "state": state,
-            "today_total_seconds": total,
+            "today_total_seconds": todo_total,
             "excluded_app": _last_heartbeat.get("excluded_app"),
             "idle_seconds": _last_heartbeat.get("idle_seconds", 0),
             "last_heartbeat": last_hb,
@@ -136,66 +125,17 @@ def _require_api_key():
     return None
 
 
-def _resolve_session_id(client_event_id: str) -> int | None:
-    if not client_event_id:
-        return None
-    row = _db._conn.execute(
-        "SELECT id FROM sessions WHERE client_event_id = ?", (client_event_id,)
-    ).fetchone()
-    return row["id"] if row else None
-
-
-def _resolve_activity_id(client_event_id: str) -> int | None:
-    if not client_event_id:
-        return None
-    row = _db._conn.execute(
-        "SELECT id FROM app_activity WHERE client_event_id = ?", (client_event_id,)
-    ).fetchone()
-    return row["id"] if row else None
-
-
-@flask_app.route("/api/ingest/session/open", methods=["POST"])
-def ingest_session_open():
-    err = _require_api_key()
-    if err: return err
-    d = request.get_json(force=True)
-    sid = _db.open_session(
-        start_time=d["start_time"], date=d["date"],
-        device_id=d.get("device_id"),
-        client_event_id=d.get("client_event_id"),
-    )
-    return jsonify({"session_id": sid})
-
-
-@flask_app.route("/api/ingest/session/close", methods=["POST"])
-def ingest_session_close():
-    err = _require_api_key()
-    if err: return err
-    d = request.get_json(force=True)
-    sid = d.get("session_id")
-    if sid is None:
-        sid = _resolve_session_id(d.get("session_client_event_id"))
-    if sid is None:
-        return jsonify({"error": "session not found"}), 404
-    _db.close_session(session_id=int(sid), end_time=d["end_time"])
-    return jsonify({"ok": True})
-
-
 @flask_app.route("/api/ingest/activity/open", methods=["POST"])
 def ingest_activity_open():
     err = _require_api_key()
-    if err: return err
+    if err:
+        return err
     d = request.get_json(force=True)
-    sid = d.get("session_id")
-    if sid is None:
-        sid = _resolve_session_id(d.get("session_client_event_id"))
-    if sid is None:
-        return jsonify({"error": "session not found"}), 404
     aid = _db.open_app_activity(
-        session_id=int(sid),
         process_name=d["process_name"],
         window_title=d.get("window_title", ""),
         start_time=d["start_time"],
+        todo_id=d.get("todo_id"),
         device_id=d.get("device_id"),
         client_event_id=d.get("client_event_id"),
     )
@@ -205,11 +145,18 @@ def ingest_activity_open():
 @flask_app.route("/api/ingest/activity/close", methods=["POST"])
 def ingest_activity_close():
     err = _require_api_key()
-    if err: return err
+    if err:
+        return err
     d = request.get_json(force=True)
     aid = d.get("activity_id")
     if aid is None:
-        aid = _resolve_activity_id(d.get("activity_client_event_id"))
+        eid = d.get("activity_client_event_id")
+        if eid:
+            row = _db._conn.execute(
+                "SELECT id FROM app_activity WHERE client_event_id = ?", (eid,)
+            ).fetchone()
+            if row:
+                aid = row["id"]
     if aid is None:
         return jsonify({"error": "activity not found"}), 404
     _db.close_app_activity(activity_id=int(aid), end_time=d["end_time"])
@@ -219,7 +166,8 @@ def ingest_activity_close():
 @flask_app.route("/api/ingest/todo/start", methods=["POST"])
 def ingest_todo_start():
     err = _require_api_key()
-    if err: return err
+    if err:
+        return err
     d = request.get_json(force=True)
     sid = _db.start_todo_timer(int(d["todo_id"]))
     return jsonify({"todo_session_id": sid})
@@ -228,7 +176,8 @@ def ingest_todo_start():
 @flask_app.route("/api/ingest/todo/stop", methods=["POST"])
 def ingest_todo_stop():
     err = _require_api_key()
-    if err: return err
+    if err:
+        return err
     d = request.get_json(force=True)
     kwargs = {"reason": d.get("reason", "manual")}
     if d.get("end_time"):
@@ -240,7 +189,8 @@ def ingest_todo_stop():
 @flask_app.route("/api/ingest/todo/active", methods=["GET"])
 def ingest_todo_active():
     err = _require_api_key()
-    if err: return err
+    if err:
+        return err
     row = _db.get_active_todo_session()
     return jsonify({"active": row})
 
@@ -248,23 +198,17 @@ def ingest_todo_active():
 @flask_app.route("/api/ingest/todo/auto_paused", methods=["GET"])
 def ingest_todo_auto_paused():
     err = _require_api_key()
-    if err: return err
+    if err:
+        return err
     row = _db.get_recently_auto_paused_todo()
     return jsonify({"todo": row})
-
-
-@flask_app.route("/api/admin/cleanup", methods=["POST"])
-def admin_cleanup():
-    err = _require_api_key()
-    if err: return err
-    report = _db.cleanup_stale_open_sessions()
-    return jsonify(report)
 
 
 @flask_app.route("/api/ingest/heartbeat", methods=["POST"])
 def ingest_heartbeat():
     err = _require_api_key()
-    if err: return err
+    if err:
+        return err
     d = request.get_json(force=True) or {}
     _last_heartbeat["time"] = datetime.now(timezone.utc).isoformat()
     _last_heartbeat["device_id"] = d.get("device_id")
@@ -275,6 +219,14 @@ def ingest_heartbeat():
     return jsonify({"ok": True})
 
 
+@flask_app.route("/api/admin/cleanup", methods=["POST"])
+def admin_cleanup():
+    err = _require_api_key()
+    if err:
+        return err
+    return jsonify(_db.cleanup_orphan_todo_sessions())
+
+
 def _get_excluded_processes() -> set:
     try:
         with open(_config_path) as f:
@@ -282,12 +234,6 @@ def _get_excluded_processes() -> set:
         return {p.lower() for p in cfg.get("excluded_processes", [])}
     except Exception:
         return set()
-
-
-@flask_app.route("/api/sessions/<date>")
-def sessions_for_date(date):
-    sessions = _db.get_sessions_for_date(date)
-    return jsonify({"sessions": sessions})
 
 
 @flask_app.route("/api/config", methods=["GET"])
@@ -343,10 +289,9 @@ def _serialize_todo(t: dict) -> dict:
 def list_todos():
     status = request.args.get("status")
     todos = _db.get_todos(status_filter=status)
-    date = datetime.now().strftime("%Y-%m-%d")
     return jsonify({
         "todos": [_serialize_todo(t) for t in todos],
-        "completed_today": _db.get_completed_today_count(date),
+        "completed_today": _db.get_completed_today_count(_today_utc()),
     })
 
 
@@ -422,7 +367,7 @@ def complete_todo(todo_id):
 
 @flask_app.route("/api/stats/daily")
 def stats_daily():
-    rows = _db.get_daily_summary(days=14)
+    rows = _db.get_daily_todo_summary(days=14)
     return jsonify({"rows": [
         {"label": r["date"], "total_seconds": r["total_seconds"],
          "formatted": format_duration(r["total_seconds"])} for r in rows
@@ -431,7 +376,7 @@ def stats_daily():
 
 @flask_app.route("/api/stats/weekly")
 def stats_weekly():
-    rows = _db.get_weekly_totals(weeks=8)
+    rows = _db.get_weekly_todo_totals(weeks=8)
     return jsonify({"rows": [
         {"label": r["week"], "total_seconds": r["total_seconds"],
          "formatted": format_duration(r["total_seconds"])} for r in rows
@@ -440,7 +385,7 @@ def stats_weekly():
 
 @flask_app.route("/api/stats/monthly")
 def stats_monthly():
-    rows = _db.get_monthly_totals(months=6)
+    rows = _db.get_monthly_todo_totals(months=6)
     return jsonify({"rows": [
         {"label": r["month"], "total_seconds": r["total_seconds"],
          "formatted": format_duration(r["total_seconds"])} for r in rows
@@ -463,6 +408,10 @@ def _reason_label(reason: str) -> str:
         return "유휴 중단 (키보드·마우스 없음)"
     if reason == "completed":
         return "작업 완료"
+    if reason == "abandoned":
+        return "비정상 종료로 자동 정리"
+    if reason == "interrupted":
+        return "다른 작업 시작으로 중단"
     if reason.startswith("excluded:"):
         app = reason[len("excluded:"):]
         return f"{app} 실행으로 중단"

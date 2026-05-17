@@ -245,6 +245,14 @@ def ingest_todo_active():
     return jsonify({"active": row})
 
 
+@flask_app.route("/api/ingest/todo/auto_paused", methods=["GET"])
+def ingest_todo_auto_paused():
+    err = _require_api_key()
+    if err: return err
+    row = _db.get_recently_auto_paused_todo()
+    return jsonify({"todo": row})
+
+
 @flask_app.route("/api/admin/cleanup", methods=["POST"])
 def admin_cleanup():
     err = _require_api_key()

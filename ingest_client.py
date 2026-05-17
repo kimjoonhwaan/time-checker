@@ -180,6 +180,12 @@ class IngestClient:
         self._cached_active_todo = resp.get("active")
         return self._cached_active_todo
 
+    def get_recently_auto_paused_todo(self) -> Optional[dict]:
+        resp = self._get("/api/ingest/todo/auto_paused")
+        if resp is None:
+            return None
+        return resp.get("todo")
+
     def start_todo_timer(self, todo_id: int) -> Optional[int]:
         resp = self._post("/api/ingest/todo/start", {"todo_id": int(todo_id)})
         return resp.get("todo_session_id") if resp else None

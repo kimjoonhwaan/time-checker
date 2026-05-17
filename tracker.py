@@ -154,9 +154,21 @@ class TrackerLoop:
             pass
 
     def _auto_resume_todo_if_needed(self):
-        if self._auto_paused_todo_id:
+        todo_id = self._auto_paused_todo_id
+        if not todo_id:
+            # Memory was cleared (e.g. tracker restarted between pause and
+            # resume). Ask the server which todo was last auto-paused by a
+            # tracker and pick it up.
             try:
-                self._db.start_todo_timer(self._auto_paused_todo_id)
+                if hasattr(self._db, "get_recently_auto_paused_todo"):
+                    row = self._db.get_recently_auto_paused_todo()
+                    if row:
+                        todo_id = row["todo_id"]
+            except Exception:
+                pass
+        if todo_id:
+            try:
+                self._db.start_todo_timer(todo_id)
             except Exception:
                 pass
             self._auto_paused_todo_id = None

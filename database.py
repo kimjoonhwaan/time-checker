@@ -326,6 +326,26 @@ class DatabaseManager:
             self._conn.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
             self._conn.commit()
 
+    def get_recently_auto_paused_todo(self, within_seconds: int = 3600) -> dict:
+        """Most recently paused todo whose last todo_session was closed by
+        the tracker (reason 'idle' or 'excluded:*'). Used by the tracker as a
+        fallback to resume after a state IDLE→TRACKING transition when its
+        in-memory _auto_paused_todo_id is missing (e.g. restart)."""
+        cur = self._conn.execute(f"""
+            SELECT t.id AS todo_id, t.title, ts.end_time, ts.pause_reason
+            FROM todos t
+            JOIN todo_sessions ts ON ts.todo_id = t.id
+            WHERE t.status = 'paused'
+              AND ts.id = (SELECT MAX(id) FROM todo_sessions WHERE todo_id = t.id)
+              AND ts.end_time IS NOT NULL
+              AND (ts.pause_reason = 'idle' OR ts.pause_reason LIKE 'excluded:%')
+              AND (julianday('now') - julianday(ts.end_time)) * 86400 <= ?
+            ORDER BY ts.end_time DESC
+            LIMIT 1
+        """, (within_seconds,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
     def get_active_todo_session(self) -> dict:
         cur = self._conn.execute(
             """SELECT ts.*, t.title FROM todo_sessions ts

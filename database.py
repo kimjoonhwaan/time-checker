@@ -14,7 +14,7 @@ two parallel systems.
 """
 import sqlite3
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 
 
 class DatabaseManager:
@@ -22,6 +22,8 @@ class DatabaseManager:
     # heartbeat from any device. If the tracker dies, the displayed counter
     # freezes within this grace window instead of growing forever.
     _HEARTBEAT_GRACE_SECONDS = 60
+    # Day boundary for "task crossed into a new day" auto-completion.
+    _KST = timezone(timedelta(hours=9))
 
     def __init__(self, db_path: str):
         self._db_path = db_path
@@ -229,9 +231,16 @@ class DatabaseManager:
         row = cur.fetchone()
         return dict(row) if row else None
 
-    def start_todo_timer(self, todo_id: int) -> int:
+    def start_todo_timer(self, todo_id: int):
         now_iso = datetime.now(timezone.utc).isoformat()
         with self._lock:
+            # A completed (or missing) todo must never be resurrected — neither
+            # by the dashboard, the ingest API, nor the tracker's auto-resume.
+            row = self._conn.execute(
+                "SELECT status FROM todos WHERE id = ?", (todo_id,)
+            ).fetchone()
+            if row is None or row["status"] == "done":
+                return None
             # Auto-pause any currently open todo using a heartbeat-aware end.
             active = self._conn.execute(
                 "SELECT id, todo_id, start_time FROM todo_sessions "
@@ -433,9 +442,59 @@ class DatabaseManager:
         self._lock is already held."""
         return self._live_cutoff().isoformat()
 
+    # ── Day-boundary auto-completion ────────────────────────────
+
+    @staticmethod
+    def _kst_midnight_after_utc(start_utc: datetime) -> datetime:
+        """The KST midnight (00:00) that follows start_utc's KST date,
+        returned in UTC. This is the moment the task crossed into a new day."""
+        kst_date = start_utc.astimezone(DatabaseManager._KST).date()
+        boundary_kst = datetime.combine(
+            kst_date + timedelta(days=1), time(0, 0), tzinfo=DatabaseManager._KST
+        )
+        return boundary_kst.astimezone(timezone.utc)
+
+    def complete_day_crossed_todos(self) -> int:
+        """Any open todo_session whose start date (in KST) is before today's
+        KST date is closed at its start day's KST midnight and the todo is
+        marked done. Returns how many todos were auto-completed."""
+        with self._lock:
+            now_utc = datetime.now(timezone.utc)
+            today_kst = now_utc.astimezone(self._KST).date()
+            open_rows = self._conn.execute(
+                "SELECT id, todo_id, start_time FROM todo_sessions "
+                "WHERE end_time IS NULL"
+            ).fetchall()
+            completed = 0
+            for r in open_rows:
+                try:
+                    start = datetime.fromisoformat(r["start_time"])
+                except Exception:
+                    continue
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=timezone.utc)
+                if start.astimezone(self._KST).date() >= today_kst:
+                    continue  # same KST day — leave it running
+                end_iso = self._kst_midnight_after_utc(start).isoformat()
+                self._close_todo_session_locked(
+                    r["id"], r["todo_id"], end_iso, "day_rollover"
+                )
+                self._conn.execute(
+                    "UPDATE todos SET status='done', completed_at=? "
+                    "WHERE id=? AND status!='done'",
+                    (end_iso, r["todo_id"])
+                )
+                completed += 1
+            self._conn.commit()
+            return completed
+
     # ── Cleanup ─────────────────────────────────────────────────
 
     def cleanup_orphan_todo_sessions(self, stale_seconds: int = 14400) -> dict:
+        # Day-crossed tasks complete cleanly first (closes their open session
+        # at the day boundary), so the stale sweep below only touches sessions
+        # that are genuinely abandoned within the same day.
+        day_completed = self.complete_day_crossed_todos()
         """Close any todo_session that's been open longer than stale_seconds
         using the heartbeat cutoff as end_time. Mark its todo paused.
         Returns a small report."""
@@ -472,6 +531,7 @@ class DatabaseManager:
             closed_activities = self._conn.total_changes
             self._conn.commit()
             return {
+                "day_completed_todos": day_completed,
                 "closed_todo_sessions": closed,
                 "closed_activities_estimate": closed_activities,
             }

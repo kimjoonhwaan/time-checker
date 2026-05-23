@@ -109,6 +109,15 @@ class TrackerLoop:
     # ── Main tick ────────────────────────────────────────────────
 
     def _tick(self):
+        # LOCAL mode (direct DatabaseManager): auto-complete any todo that ran
+        # past the KST day boundary. REMOTE mode's _db is an IngestClient that
+        # lacks this method — there the server's heartbeat handler does it.
+        if hasattr(self._db, "complete_day_crossed_todos"):
+            try:
+                self._db.complete_day_crossed_todos()
+            except Exception:
+                pass
+
         if self._pause.is_set():
             self._transition_to_paused(TrackerState.PAUSED, "manual")
             return
@@ -219,8 +228,9 @@ class TrackerLoop:
         if not todo_id:
             return
         try:
-            self._db.start_todo_timer(todo_id)
-            self._current_todo_id = todo_id
+            sid = self._db.start_todo_timer(todo_id)
+            if sid:  # None means the todo was completed → never resurrect it
+                self._current_todo_id = todo_id
         except Exception:
             pass
         self._auto_paused_todo_id = None

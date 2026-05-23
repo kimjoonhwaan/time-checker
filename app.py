@@ -216,6 +216,11 @@ def ingest_heartbeat():
     _last_heartbeat["idle_seconds"] = d.get("idle_seconds", 0)
     _last_heartbeat["excluded_app"] = d.get("excluded_app")
     _db.record_heartbeat(d.get("device_id"), _last_heartbeat["time"])
+    # Periodic (≤30s) trigger for KST day-boundary auto-completion in REMOTE mode.
+    try:
+        _db.complete_day_crossed_todos()
+    except Exception:
+        pass
     return jsonify({"ok": True})
 
 

@@ -292,6 +292,12 @@ def _serialize_todo(t: dict) -> dict:
 
 @flask_app.route("/api/todos", methods=["GET"])
 def list_todos():
+    # Self-heal on dashboard load: completes prior-day tasks even if no tracker
+    # is running to send heartbeats (e.g. tracker was off overnight).
+    try:
+        _db.complete_day_crossed_todos()
+    except Exception:
+        pass
     status = request.args.get("status")
     todos = _db.get_todos(status_filter=status)
     return jsonify({

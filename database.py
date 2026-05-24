@@ -455,34 +455,47 @@ class DatabaseManager:
         return boundary_kst.astimezone(timezone.utc)
 
     def complete_day_crossed_todos(self) -> int:
-        """Any open todo_session whose start date (in KST) is before today's
-        KST date is closed at its start day's KST midnight and the todo is
-        marked done. Returns how many todos were auto-completed."""
+        """Auto-complete any worked-on todo that belongs to a previous KST day.
+
+        A todo qualifies when its status is in_progress/paused AND its most
+        recent session started on an earlier KST date — this covers both a
+        session still open across midnight and one already idle-paused before
+        midnight. Any still-open session is closed at that day's KST midnight,
+        then the todo is marked done. Returns how many todos were completed.
+        """
         with self._lock:
-            now_utc = datetime.now(timezone.utc)
-            today_kst = now_utc.astimezone(self._KST).date()
-            open_rows = self._conn.execute(
-                "SELECT id, todo_id, start_time FROM todo_sessions "
-                "WHERE end_time IS NULL"
-            ).fetchall()
+            today_kst = datetime.now(timezone.utc).astimezone(self._KST).date()
+            rows = self._conn.execute("""
+                SELECT t.id AS todo_id, MAX(ts.start_time) AS last_start
+                FROM todos t
+                JOIN todo_sessions ts ON ts.todo_id = t.id
+                WHERE t.status IN ('in_progress', 'paused')
+                GROUP BY t.id
+            """).fetchall()
             completed = 0
-            for r in open_rows:
+            for r in rows:
                 try:
-                    start = datetime.fromisoformat(r["start_time"])
+                    last = datetime.fromisoformat(r["last_start"])
                 except Exception:
                     continue
-                if start.tzinfo is None:
-                    start = start.replace(tzinfo=timezone.utc)
-                if start.astimezone(self._KST).date() >= today_kst:
-                    continue  # same KST day — leave it running
-                end_iso = self._kst_midnight_after_utc(start).isoformat()
-                self._close_todo_session_locked(
-                    r["id"], r["todo_id"], end_iso, "day_rollover"
-                )
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                if last.astimezone(self._KST).date() >= today_kst:
+                    continue  # last worked today (KST) — still live
+                tid = r["todo_id"]
+                boundary_iso = self._kst_midnight_after_utc(last).isoformat()
+                # Close any session left open across the boundary.
+                for s in self._conn.execute(
+                    "SELECT id FROM todo_sessions "
+                    "WHERE todo_id = ? AND end_time IS NULL", (tid,)
+                ).fetchall():
+                    self._close_todo_session_locked(
+                        s["id"], tid, boundary_iso, "day_rollover"
+                    )
                 self._conn.execute(
                     "UPDATE todos SET status='done', completed_at=? "
                     "WHERE id=? AND status!='done'",
-                    (end_iso, r["todo_id"])
+                    (boundary_iso, tid)
                 )
                 completed += 1
             self._conn.commit()

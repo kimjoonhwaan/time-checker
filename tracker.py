@@ -124,6 +124,19 @@ class TrackerLoop:
 
         idle_secs = self._idle_detector.get_idle_seconds()
         threshold = self._config.get("idle_threshold_seconds", 60)
+
+        # LOCAL mode: record idle into the DB so _live_cutoff can freeze the
+        # active counter during idle. REMOTE mode's _db (IngestClient) lacks
+        # record_heartbeat — there the heartbeat thread reports idle instead.
+        if hasattr(self._db, "record_heartbeat"):
+            try:
+                self._db.record_heartbeat(
+                    self._config.get("device_id"),
+                    datetime.now(timezone.utc).isoformat(),
+                    idle_secs,
+                )
+            except Exception:
+                pass
         if idle_secs >= threshold:
             idle_start = datetime.now(timezone.utc) - timedelta(seconds=idle_secs)
             self._transition_to_paused(TrackerState.IDLE, "idle",

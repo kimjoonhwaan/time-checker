@@ -25,8 +25,9 @@ class DatabaseManager:
     # Day boundary for "task crossed into a new day" auto-completion.
     _KST = timezone(timedelta(hours=9))
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, idle_threshold_seconds: int = 60):
         self._db_path = db_path
+        self._idle_threshold = idle_threshold_seconds
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -87,6 +88,7 @@ class DatabaseManager:
             "ALTER TABLE app_activity ADD COLUMN client_event_id TEXT",
             "ALTER TABLE todo_sessions ADD COLUMN pause_reason TEXT",
             "ALTER TABLE todo_sessions ADD COLUMN device_id TEXT",
+            "ALTER TABLE device_heartbeats ADD COLUMN idle_seconds REAL DEFAULT 0",
         ]
         for sql in migrations:
             try:
@@ -406,14 +408,17 @@ class DatabaseManager:
 
     # ── Heartbeat / live cutoff ─────────────────────────────────
 
-    def record_heartbeat(self, device_id: str, time_iso: str):
+    def record_heartbeat(self, device_id: str, time_iso: str,
+                         idle_seconds: float = 0):
         if not device_id:
             return
         with self._lock:
             self._conn.execute(
-                "INSERT INTO device_heartbeats(device_id, time) VALUES(?, ?) "
-                "ON CONFLICT(device_id) DO UPDATE SET time = excluded.time",
-                (device_id, time_iso)
+                "INSERT INTO device_heartbeats(device_id, time, idle_seconds) "
+                "VALUES(?, ?, ?) "
+                "ON CONFLICT(device_id) DO UPDATE SET time = excluded.time, "
+                "idle_seconds = excluded.idle_seconds",
+                (device_id, time_iso, idle_seconds)
             )
             self._conn.commit()
 
@@ -423,19 +428,29 @@ class DatabaseManager:
         freeze at (last_heartbeat + grace) so abandoned sessions stop growing."""
         now = datetime.now(timezone.utc)
         row = self._conn.execute(
-            "SELECT MAX(time) AS x FROM device_heartbeats"
+            "SELECT time, idle_seconds FROM device_heartbeats "
+            "ORDER BY time DESC LIMIT 1"
         ).fetchone()
-        last = row["x"] if row else None
-        if not last:
+        if not row or not row["time"]:
             return now
         try:
-            last_dt = datetime.fromisoformat(last)
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=timezone.utc)
-            grace_end = last_dt + timedelta(seconds=self._HEARTBEAT_GRACE_SECONDS)
-            return grace_end if grace_end < now else now
+            hb = datetime.fromisoformat(row["time"])
+            if hb.tzinfo is None:
+                hb = hb.replace(tzinfo=timezone.utc)
         except Exception:
             return now
+        # Death cap: if the tracker stopped sending heartbeats, freeze the
+        # active counter at (last heartbeat + grace) instead of growing forever.
+        grace_end = hb + timedelta(seconds=self._HEARTBEAT_GRACE_SECONDS)
+        fresh_cutoff = grace_end if grace_end < now else now
+        # Idle freeze: while the user is idle past the threshold, the live
+        # counter stops at the last-input instant — the same point the eventual
+        # backdated idle-pause will record, so display and storage agree.
+        idle = row["idle_seconds"] or 0
+        if idle >= self._idle_threshold:
+            last_input = hb - timedelta(seconds=idle)
+            return min(fresh_cutoff, last_input)
+        return fresh_cutoff
 
     def _live_cutoff_iso_unlocked(self) -> str:
         """Same as _live_cutoff().isoformat() but safe to call while

@@ -95,7 +95,9 @@ def main():
     else:
         from database import DatabaseManager
         from app import run_flask
-        backend = DatabaseManager(str(paths.server_db_path(config)))
+        backend = DatabaseManager(
+            str(paths.server_db_path(config)),
+            idle_threshold_seconds=config.get("idle_threshold_seconds", 60))
         backend.cleanup_orphan_todo_sessions()  # tidy on startup
         flask_thread = threading.Thread(
             target=run_flask, args=(backend, None, config, shutdown_event),

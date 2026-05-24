@@ -215,7 +215,8 @@ def ingest_heartbeat():
     _last_heartbeat["state"] = d.get("state", "unknown")
     _last_heartbeat["idle_seconds"] = d.get("idle_seconds", 0)
     _last_heartbeat["excluded_app"] = d.get("excluded_app")
-    _db.record_heartbeat(d.get("device_id"), _last_heartbeat["time"])
+    _db.record_heartbeat(d.get("device_id"), _last_heartbeat["time"],
+                         idle_seconds=d.get("idle_seconds", 0) or 0)
     # Periodic (≤30s) trigger for KST day-boundary auto-completion in REMOTE mode.
     try:
         _db.complete_day_crossed_todos()

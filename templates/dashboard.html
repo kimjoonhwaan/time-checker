@@ -183,7 +183,7 @@
       <div class="card-title">앱별 사용 시간 (오늘)</div>
       <div id="taskAppList"></div>
     </div>
-    <div class="card">
+    <div class="card" style="display:none">
       <div class="card-title">작업 이력</div>
       <div id="taskHistory" class="history-scroll"></div>
     </div>
@@ -330,8 +330,6 @@
       return;
     }
 
-    // Update live timers for in_progress items
-    const now = Date.now();
     el.innerHTML = todos.map(t => {
       const dotClass = `dot-${t.status}`;
       const pClass = { high:'p-high', medium:'p-medium', low:'p-low' }[t.priority] || 'p-medium';
@@ -347,23 +345,12 @@
         <div class="status-dot ${dotClass}"></div>
         <span class="priority-badge ${pClass}">${pLabel}</span>
         <span class="todo-title-text">${esc(t.title)}</span>
-        <span class="todo-time-badge" data-id="${t.id}" data-base="${t.total_seconds}">${timeStr}</span>
+        <span class="todo-time-badge" data-id="${t.id}">${timeStr}</span>
         ${goBtn}
       </div>`;
     }).join('');
-
-    // Kick off live counters for in_progress items in list view
-    todos.filter(t => t.status === 'in_progress').forEach(t => {
-      const badge = el.querySelector(`[data-id="${t.id}"]`);
-      if (!badge) return;
-      const base = t.total_seconds;
-      const start = Date.now();
-      // Store interval id on element to clear on next render
-      const iv = setInterval(() => {
-        if (!badge.isConnected) { clearInterval(iv); return; }
-        badge.textContent = fmt(base + (Date.now() - start) / 1000);
-      }, 1000);
-    });
+    // No per-second extrapolation: the list refreshes from stored totals
+    // every few seconds, so what you see is always the accurate accrued time.
   }
 
   async function openTask(id) {
@@ -379,30 +366,24 @@
 
   // ── TASK VIEW ────────────────────────────────────────────────
   async function loadTaskView(id) {
-    const [todoRes, sumRes, appsRes, histRes] = await Promise.all([
+    const [todoRes, sumRes, appsRes] = await Promise.all([
       fetch(`/api/todos/${id}`),
       fetch('/api/summary/today'),
       fetch('/api/apps/today'),
-      fetch(`/api/todos/${id}/history`),
     ]);
     const todo = await todoRes.json();
     const sum = await sumRes.json();
     const appsData = await appsRes.json();
-    const histData = await histRes.json();
 
     document.getElementById('taskName').textContent = todo.title;
     document.getElementById('task-today-total').textContent = sum.todo_total_formatted || sum.total_formatted;
 
-    if (todo.status === 'in_progress') {
-      startLiveTimer(todo.total_seconds);
-    } else {
-      stopLiveTimer();
-      document.getElementById('timerDisplay').textContent = fmt(todo.total_seconds);
-    }
+    // Anchor the display to the stored total; the live timer only ticks while
+    // the tracker reports an active state (see updateStatusUI).
+    document.getElementById('timerDisplay').textContent = fmt(todo.total_seconds);
 
     document.getElementById('taskNotes').value = todo.notes || '';
     renderApps(appsData.apps);
-    renderHistory(histData.history, todo.status === 'in_progress');
     pollTrackerStatus();
   }
 
@@ -511,45 +492,46 @@
   async function pollTrackerStatus() {
     if (_currentTodoId === null) return;
     try {
-      const [statusRes, todoRes, histRes] = await Promise.all([
+      const [statusRes, todoRes, sumRes] = await Promise.all([
         fetch('/api/tracker/status'),
         fetch(`/api/todos/${_currentTodoId}`),
-        fetch(`/api/todos/${_currentTodoId}/history`),
+        fetch('/api/summary/today'),
       ]);
       const s = await statusRes.json();
       const todo = await todoRes.json();
-      const histData = await histRes.json();
-      updateStatusUI(s);
-      renderHistory(histData.history, todo.status === 'in_progress');
+      const sum = await sumRes.json();
+      document.getElementById('task-today-total').textContent =
+        sum.todo_total_formatted || sum.total_formatted;
+      updateStatusUI(s, todo);
     } catch(e) { console.error('pollTrackerStatus error', e); }
   }
 
-  function updateStatusUI(s) {
+  function updateStatusUI(s, todo) {
     const display = document.getElementById('timerDisplay');
     const statusEl = document.getElementById('trackerStatus');
 
     display.className = 'timer-display';
     const configs = {
-      tracking: { cls: 'status-tracking', icon: '●', label: '작업 중',   color: '' },
+      active:   { cls: 'status-tracking', icon: '●', label: '작업 중',   color: '' },
       idle:     { cls: 'status-idle',     icon: '⏸', label: '유휴 중 (입력 대기)', color: 'idle' },
       excluded: { cls: 'status-excluded', icon: '🚫', label: `제외 앱${s.excluded_app ? ' — ' + s.excluded_app : ''}`, color: 'excluded' },
       paused:   { cls: 'status-paused',   icon: '⏹', label: '일시정지', color: 'paused' },
+      offline:  { cls: 'status-paused',   icon: '○', label: '트래커 오프라인', color: 'paused' },
     };
     const cfg = configs[s.state] || configs.idle;
     if (cfg.color) display.classList.add(cfg.color);
     statusEl.className = `tracker-status ${cfg.cls}`;
     statusEl.textContent = `${cfg.icon} ${cfg.label}`;
 
-    // Pause/resume live timer based on tracker state
-    if (s.state === 'tracking') {
-      if (!_liveInterval) {
-        // Resume: re-fetch current total_seconds
-        fetch(`/api/todos/${_currentTodoId}`).then(r => r.json()).then(t => {
-          if (t.status === 'in_progress') startLiveTimer(t.total_seconds);
-        });
-      }
+    // Re-anchor to the stored total every poll (no drift). Only extrapolate
+    // smoothly between polls while the tracker says the user is actively working.
+    const base = todo ? (todo.total_seconds || 0) : 0;
+    const isActive = s.state === 'active' && todo && todo.status === 'in_progress';
+    if (isActive) {
+      startLiveTimer(base);        // resets base + start anchor
     } else {
-      if (_liveInterval) stopLiveTimer();
+      stopLiveTimer();
+      display.textContent = fmt(base);
     }
   }
 

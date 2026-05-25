@@ -50,32 +50,26 @@ class TestFindFreePort:
         assert result != occupied
 
 
-# ── Flask API ─────────────────────────────────────────────────
+# ── Flask API (real in-memory DB, tick-accumulator model) ─────
 
-@pytest.fixture
-def mock_db():
-    db = MagicMock()
-    db.get_today_total_seconds.return_value = 3661
-    db.get_sessions_for_date.return_value = [
-        {"id": 1, "start_time": "2025-01-01T09:00:00+00:00",
-         "end_time": "2025-01-01T10:01:01+00:00", "total_seconds": 3661}
-    ]
-    db.get_app_breakdown.return_value = [
-        {"process_name": "code.exe", "total_seconds": 1800},
-        {"process_name": "chrome.exe", "total_seconds": 1800},
-    ]
-    db.get_weekly_summary.return_value = []
-    return db
+from database import DatabaseManager
 
 
 @pytest.fixture
-def client(mock_db, tmp_path):
+def client(tmp_path):
     cfg_path = tmp_path / "config.json"
-    cfg_path.write_text('{"idle_threshold_seconds": 300}')
-    init_app(mock_db, cfg_path)
+    cfg_path.write_text('{"idle_threshold_seconds": 60}')
+    db = DatabaseManager(":memory:")
+    init_app(db, tracker=None, config_path=cfg_path, api_key=None)
     flask_app.config["TESTING"] = True
     with flask_app.test_client() as c:
+        c._db = db
         yield c
+    db.close()
+
+
+def _today():
+    return DatabaseManager.kst_today()
 
 
 class TestSummaryToday:
@@ -83,59 +77,51 @@ class TestSummaryToday:
         res = client.get("/api/summary/today")
         assert res.status_code == 200
         data = res.get_json()
-        assert "date" in data
-        assert "total_seconds" in data
-        assert "total_formatted" in data
-        assert "sessions" in data
+        assert {"date", "todo_total_seconds", "todo_total_formatted"} <= data.keys()
 
-    def test_total_formatted_value(self, client):
-        res = client.get("/api/summary/today")
-        data = res.get_json()
-        assert data["total_seconds"] == 3661
-        assert data["total_formatted"] == "1h 01m 01s"
+    def test_reflects_accrued_ticks(self, client):
+        tid = client.post("/api/todos", json={"title": "t"}).get_json()["id"]
+        client.post(f"/api/todos/{tid}/start")
+        client.post("/api/ingest/tick", json={
+            "event_id": "a", "kst_date": _today(), "active_seconds": 3661,
+            "process_name": "code.exe", "todo_id": tid, "state": "active"})
+        data = client.get("/api/summary/today").get_json()
+        assert data["todo_total_seconds"] == 3661
+        assert data["todo_total_formatted"] == "1h 01m 01s"
 
 
-class TestSummaryWeek:
-    def test_always_returns_seven_days(self, client, mock_db):
-        mock_db.get_weekly_summary.return_value = []
-        res = client.get("/api/summary/week")
-        data = res.get_json()
-        assert len(data["days"]) == 7
+class TestTodoLifecycle:
+    def test_start_sets_active(self, client):
+        tid = client.post("/api/todos", json={"title": "t"}).get_json()["id"]
+        client.post(f"/api/todos/{tid}/start")
+        assert client.get("/api/active-todo").get_json()["todo_id"] == tid
 
-    def test_missing_days_filled_with_zero(self, client, mock_db):
-        mock_db.get_weekly_summary.return_value = []
-        res = client.get("/api/summary/week")
-        data = res.get_json()
-        assert all(d["total_seconds"] == 0 for d in data["days"])
+    def test_completed_cannot_restart(self, client):
+        tid = client.post("/api/todos", json={"title": "t"}).get_json()["id"]
+        client.post(f"/api/todos/{tid}/complete")
+        res = client.post(f"/api/todos/{tid}/start")
+        assert res.status_code == 400
 
-    def test_known_day_has_correct_total(self, client, mock_db):
-        today = datetime.now().strftime("%Y-%m-%d")
-        mock_db.get_weekly_summary.return_value = [{"date": today, "total_seconds": 7200}]
-        res = client.get("/api/summary/week")
-        data = res.get_json()
-        today_entry = next(d for d in data["days"] if d["date"] == today)
-        assert today_entry["total_seconds"] == 7200
+
+class TestIngestTickIdempotent:
+    def test_replay_does_not_double_count(self, client):
+        tid = client.post("/api/todos", json={"title": "t"}).get_json()["id"]
+        client.post(f"/api/todos/{tid}/start")
+        payload = {"event_id": "dup", "kst_date": _today(), "active_seconds": 10,
+                   "process_name": "code.exe", "todo_id": tid, "state": "active"}
+        client.post("/api/ingest/tick", json=payload)
+        client.post("/api/ingest/tick", json=payload)  # replay
+        assert client.get("/api/summary/today").get_json()["todo_total_seconds"] == 10
 
 
 class TestAppsToday:
-    def test_percentage_sums_to_100(self, client):
-        res = client.get("/api/apps/today")
-        data = res.get_json()
-        total_pct = sum(a["percentage"] for a in data["apps"])
-        assert abs(total_pct - 100.0) < 0.1
-
-    def test_each_app_has_required_keys(self, client):
-        res = client.get("/api/apps/today")
-        data = res.get_json()
+    def test_keys_and_percentage(self, client):
+        client.post("/api/ingest/tick", json={
+            "event_id": "p", "kst_date": _today(), "active_seconds": 100,
+            "process_name": "code.exe", "excluded": False, "state": "active"})
+        data = client.get("/api/apps/today").get_json()
+        assert data["apps"]
         for app in data["apps"]:
-            assert "process_name" in app
-            assert "total_seconds" in app
-            assert "formatted" in app
-            assert "percentage" in app
-
-
-class TestSessionsForDate:
-    def test_passes_date_to_db(self, client, mock_db):
-        mock_db.get_sessions_for_date.return_value = []
-        client.get("/api/sessions/2025-06-01")
-        mock_db.get_sessions_for_date.assert_called_once_with("2025-06-01")
+            assert {"process_name", "total_seconds", "formatted",
+                    "percentage", "is_excluded"} <= app.keys()
+        assert abs(sum(a["percentage"] for a in data["apps"]) - 100.0) < 0.1

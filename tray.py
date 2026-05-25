@@ -5,8 +5,6 @@ from io import BytesIO
 from PIL import Image, ImageDraw
 import pystray
 
-from tracker import TrackerState
-
 
 def _make_icon(color: str) -> Image.Image:
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -15,11 +13,15 @@ def _make_icon(color: str) -> Image.Image:
     return img
 
 
+# State strings emitted by TrackerLoop.get_status()
 ICONS = {
-    TrackerState.TRACKING: _make_icon("#22c55e"),
-    TrackerState.IDLE: _make_icon("#eab308"),
-    TrackerState.PAUSED: _make_icon("#ef4444"),
+    "active":   _make_icon("#22c55e"),
+    "idle":     _make_icon("#eab308"),
+    "excluded": _make_icon("#eab308"),
+    "paused":   _make_icon("#ef4444"),
+    "offline":  _make_icon("#6b7280"),
 }
+_DEFAULT_ICON = ICONS["idle"]
 
 
 class TrayApp:
@@ -34,7 +36,7 @@ class TrayApp:
         self._dashboard_url = dashboard_url
         self._icon = pystray.Icon(
             name="timechecker",
-            icon=ICONS[TrackerState.IDLE],
+            icon=_DEFAULT_ICON,
             title="Time Checker",
             menu=self._build_menu()
         )
@@ -59,9 +61,11 @@ class TrayApp:
         h, rem = divmod(total, 3600)
         m = rem // 60
         state_labels = {
-            TrackerState.TRACKING: "추적 중",
-            TrackerState.IDLE: "유휴",
-            TrackerState.PAUSED: "일시정지",
+            "active": "추적 중",
+            "idle": "유휴",
+            "excluded": "제외 앱",
+            "paused": "일시정지",
+            "offline": "오프라인",
         }
         label = state_labels.get(status["state"], "")
         return f"오늘: {h}h {m:02d}m  ({label})"
@@ -88,7 +92,7 @@ class TrayApp:
             try:
                 status = self._tracker.get_status()
                 state = status["state"]
-                self._icon.icon = ICONS.get(state, ICONS[TrackerState.IDLE])
+                self._icon.icon = ICONS.get(state, _DEFAULT_ICON)
                 self._icon.title = self._status_label()
             except Exception:
                 pass

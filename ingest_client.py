@@ -1,16 +1,14 @@
-"""HTTP client used by the local tracker to send measurements to the server.
+"""HTTP client the local tracker uses to send measurements to the server.
 
-Mirrors the subset of `DatabaseManager` that `TrackerLoop` calls so it can be
-plugged in interchangeably. Network failures don't lose data: failed POSTs
-are persisted to a local SQLite queue and replayed by a background worker.
-
-Activity rows are addressed by client-generated UUIDs so the tracker doesn't
-need to wait for server-assigned IDs.
+Mirrors the subset of `DatabaseManager` that `TrackerLoop` calls so the two are
+interchangeable. The tracker sends *duration increments* (ticks), each with a
+unique event_id; the server accrues them idempotently. Failed POSTs are queued
+to a local SQLite file and replayed — because ticks are idempotent, replay can
+never double-count, and nothing is lost while offline.
 """
 import json
 import sqlite3
 import threading
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -29,8 +27,8 @@ class IngestClient:
         self._retry_interval = retry_interval
         self._session = requests.Session()
         self._queue_lock = threading.Lock()
-        self._cached_today_todo_total = 0
-        self._cached_active_todo: Optional[dict] = None
+        self._cached_today_total = 0
+        self._cached_active_todo_id = None
 
         Path(queue_db_path).parent.mkdir(parents=True, exist_ok=True)
         self._queue = sqlite3.connect(queue_db_path, check_same_thread=False)
@@ -64,10 +62,8 @@ class IngestClient:
                                    headers=self._headers(), timeout=self._timeout)
             if r.status_code < 400:
                 return r.json() if r.content else {}
-            if r.status_code == 401:
-                return None  # auth — won't ever succeed
             if r.status_code < 500:
-                return None  # permanent client error — don't queue
+                return None  # auth/permanent client error — don't queue
         except requests.RequestException:
             pass
         if queue_on_fail:
@@ -105,7 +101,7 @@ class IngestClient:
     def _drain_once(self):
         with self._queue_lock:
             rows = self._queue.execute(
-                "SELECT id, path, payload_json FROM pending_posts ORDER BY id LIMIT 100"
+                "SELECT id, path, payload_json FROM pending_posts ORDER BY id LIMIT 200"
             ).fetchall()
         for row_id, path, payload_json in rows:
             payload = json.loads(payload_json)
@@ -113,77 +109,45 @@ class IngestClient:
                 r = self._session.post(self._base + path, json=payload,
                                        headers=self._headers(), timeout=self._timeout)
             except requests.RequestException:
-                return  # network down — try whole queue next interval
+                return  # network down — retry whole queue next interval
             if r.status_code < 400:
-                self._delete_queued(row_id)
-            elif r.status_code == 401:
-                return  # auth issue — entire queue stalls until fixed
+                self._delete_queued(row_id)        # applied (idempotent) — safe
             elif r.status_code < 500:
-                # Permanent client error (404 stale ref, 400 bad payload, etc.).
-                # Drop the row so it doesn't block successors.
-                self._delete_queued(row_id)
+                self._delete_queued(row_id)         # permanent client error — drop
             else:
-                return  # 5xx — server may recover, retry whole queue next interval
+                return                              # 5xx — server may recover
 
     # ── DatabaseManager-compatible surface (tracker uses these) ──
 
-    def open_app_activity(self, process_name: str, window_title: str,
-                          start_time: str, todo_id: int = None) -> str:
-        eid = str(uuid.uuid4())
-        self._post("/api/ingest/activity/open", {
-            "client_event_id": eid,
+    def push_tick(self, event_id: str, kst_date: str, active_seconds,
+                  process_name: str = None, excluded: bool = False,
+                  todo_id: int = None, state: str = None,
+                  idle_seconds: float = 0, device_id: str = None):
+        self._post("/api/ingest/tick", {
+            "event_id": event_id,
+            "kst_date": kst_date,
+            "active_seconds": int(active_seconds or 0),
             "process_name": process_name,
-            "window_title": window_title,
-            "start_time": start_time,
+            "excluded": bool(excluded),
             "todo_id": todo_id,
-            "device_id": self._device_id,
-        })
-        return eid
-
-    def close_app_activity(self, activity_id, end_time: str):
-        self._post("/api/ingest/activity/close", {
-            "activity_client_event_id": activity_id,
-            "end_time": end_time,
-        })
-
-    def get_active_todo_session(self) -> Optional[dict]:
-        resp = self._get("/api/ingest/todo/active")
-        if resp is None:
-            return self._cached_active_todo
-        self._cached_active_todo = resp.get("active")
-        return self._cached_active_todo
-
-    def get_recently_auto_paused_todo(self) -> Optional[dict]:
-        resp = self._get("/api/ingest/todo/auto_paused")
-        if resp is None:
-            return None
-        return resp.get("todo")
-
-    def start_todo_timer(self, todo_id: int) -> Optional[int]:
-        resp = self._post("/api/ingest/todo/start", {"todo_id": int(todo_id)})
-        return resp.get("todo_session_id") if resp else None
-
-    def stop_todo_timer(self, todo_id: int, reason: str = "manual",
-                        end_time: str = None):
-        payload = {"todo_id": int(todo_id), "reason": reason}
-        if end_time:
-            payload["end_time"] = end_time
-        self._post("/api/ingest/todo/stop", payload)
-
-    def get_today_todo_total_seconds(self, date: str) -> int:
-        resp = self._get("/api/summary/today")
-        if resp is None:
-            return self._cached_today_todo_total
-        self._cached_today_todo_total = resp.get("todo_total_seconds", 0)
-        return self._cached_today_todo_total
-
-    def heartbeat(self, state: str, idle_seconds: float, excluded_app: Optional[str]):
-        self._post("/api/ingest/heartbeat", {
-            "device_id": self._device_id,
             "state": state,
             "idle_seconds": idle_seconds,
-            "excluded_app": excluded_app,
-        }, queue_on_fail=False)
+            "device_id": device_id or self._device_id,
+        })
+
+    def get_active_todo_id(self) -> Optional[int]:
+        resp = self._get("/api/active-todo")
+        if resp is None:
+            return self._cached_active_todo_id
+        self._cached_active_todo_id = resp.get("todo_id")
+        return self._cached_active_todo_id
+
+    def get_today_todo_total_seconds(self, date_kst: str) -> int:
+        resp = self._get("/api/summary/today")
+        if resp is None:
+            return self._cached_today_total
+        self._cached_today_total = resp.get("todo_total_seconds", 0)
+        return self._cached_today_total
 
     def close(self):
         self._shutdown.set()

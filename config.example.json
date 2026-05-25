@@ -1,6 +1,6 @@
 {
   "idle_threshold_seconds": 60,
-  "poll_interval_seconds": 30,
+  "poll_interval_seconds": 10,
   "flask_port": 5000,
   "server_url": "",
   "api_key": "",

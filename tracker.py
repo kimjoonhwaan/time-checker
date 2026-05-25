@@ -1,22 +1,24 @@
-"""Foreground-app + idle detection tracker.
+"""Tracker — the single time authority.
 
-Single state machine:
+Every poll it measures how much *active* time elapsed since the last poll and
+pushes that duration to the backend, which accrues it. There is no session to
+open/close and no timestamp subtraction on the read side:
 
-  active   — user is at the keyboard, foreground app is not excluded
-  paused   — idle threshold crossed, an excluded app is in front, or user
-             manually paused. While paused, no app_activity row is open
-             and any active todo is auto-paused.
+    delta  = clamp(now - last_tick, 0, 2*poll)   # sleep-safe
+    idle   = seconds since last keyboard/mouse input
+    active = max(0, delta - idle)                 # idle is excluded intrinsically
 
-Every state transition closes the previous app_activity row (with a
-backdated end_time when we know one — e.g. idle_start) and either opens a
-new one or leaves the slot empty. Todo pause/resume rides on the same
-transition so the two never disagree about whether time is being counted.
+`active` is attributed to the currently selected todo (the one the dashboard
+marked in_progress) unless the foreground app is excluded. Idle/excluded
+"auto-pause" is emergent: when idle or excluded, `active` is ~0 so nothing
+accrues; returning to work resumes accrual on the next tick automatically.
 """
 import ctypes
 import ctypes.wintypes
 import threading
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 import psutil
@@ -73,17 +75,10 @@ class WindowDetector:
         return any(kw in title_lower for kw in self._excluded_keywords)
 
 
-class TrackerState:
-    IDLE = "idle"
-    TRACKING = "tracking"
-    EXCLUDED = "excluded"
-    PAUSED = "paused"
-
-
 class TrackerLoop:
-    def __init__(self, db, config: dict,
+    def __init__(self, backend, config: dict,
                  shutdown_event: threading.Event, pause_event: threading.Event):
-        self._db = db
+        self._backend = backend
         self._config = config
         self._shutdown = shutdown_event
         self._pause = pause_event
@@ -92,182 +87,104 @@ class TrackerLoop:
             config.get("excluded_processes", []),
             config.get("excluded_title_keywords", [])
         )
-        self._state = TrackerState.IDLE
-        self._current_activity_id = None  # opaque handle (UUID string or int)
-        self._current_window: Optional[WindowInfo] = None
-        self._excluded_app_name: Optional[str] = None
-        self._current_todo_id: Optional[int] = None  # in-progress todo (for activity tagging)
-        self._auto_paused_todo_id: Optional[int] = None
-        self._lock = threading.Lock()
+        self._poll = config.get("poll_interval_seconds", 10)
+        self._threshold = config.get("idle_threshold_seconds", 60)
+        self._device_id = config.get("device_id")
+        self._last_tick = None  # monotonic-free: use wall clock, clamp protects us
+        self._last_idle = 0.0
+        self._last_state = "idle"
+        self._last_excluded_app = None
 
     def run(self):
-        poll = self._config.get("poll_interval_seconds", 30)
         while not self._shutdown.is_set():
-            self._tick()
-            self._shutdown.wait(timeout=poll)
-
-    # ── Main tick ────────────────────────────────────────────────
+            try:
+                self._tick()
+            except Exception:
+                pass
+            self._shutdown.wait(timeout=self._poll)
 
     def _tick(self):
-        # LOCAL mode (direct DatabaseManager): auto-complete any todo that ran
-        # past the KST day boundary. REMOTE mode's _db is an IngestClient that
-        # lacks this method — there the server's heartbeat handler does it.
-        if hasattr(self._db, "complete_day_crossed_todos"):
-            try:
-                self._db.complete_day_crossed_todos()
-            except Exception:
-                pass
+        now = datetime.now(timezone.utc)
+        if self._last_tick is None:
+            # First tick after start: anchor, accrue nothing this round.
+            self._last_tick = now
+            return
+        delta = (now - self._last_tick).total_seconds()
+        self._last_tick = now
+        # Sleep/suspend safety: never credit more than two polls of wall time.
+        delta = max(0.0, min(delta, 2 * self._poll))
+
+        idle = self._idle_detector.get_idle_seconds()
+        self._last_idle = idle
 
         if self._pause.is_set():
-            self._transition_to_paused(TrackerState.PAUSED, "manual")
-            return
-
-        idle_secs = self._idle_detector.get_idle_seconds()
-        threshold = self._config.get("idle_threshold_seconds", 60)
-
-        # LOCAL mode: record idle into the DB so _live_cutoff can freeze the
-        # active counter during idle. REMOTE mode's _db (IngestClient) lacks
-        # record_heartbeat — there the heartbeat thread reports idle instead.
-        if hasattr(self._db, "record_heartbeat"):
-            try:
-                self._db.record_heartbeat(
-                    self._config.get("device_id"),
-                    datetime.now(timezone.utc).isoformat(),
-                    idle_secs,
-                )
-            except Exception:
-                pass
-        if idle_secs >= threshold:
-            idle_start = datetime.now(timezone.utc) - timedelta(seconds=idle_secs)
-            self._transition_to_paused(TrackerState.IDLE, "idle",
-                                       end_iso=idle_start.isoformat())
-            return
-
-        window = self._window_detector.get_active_window()
-        if window is not None and window.is_excluded:
-            self._transition_to_paused(TrackerState.EXCLUDED,
-                                       f"excluded:{window.process_name}")
-            self._excluded_app_name = window.process_name
-            return
-
-        self._transition_to_active(window or WindowInfo("unknown", "", False))
-
-    # ── State transitions ───────────────────────────────────────
-
-    def _transition_to_paused(self, new_state: str, reason: str,
-                              end_iso: Optional[str] = None):
-        """Close the current activity (if any) and pause the active todo
-        (if any), using `end_iso` if provided otherwise now."""
-        end_iso = end_iso or datetime.now(timezone.utc).isoformat()
-        with self._lock:
-            if self._current_activity_id is not None:
-                try:
-                    self._db.close_app_activity(self._current_activity_id, end_iso)
-                except Exception:
-                    pass
-                self._current_activity_id = None
-                self._current_window = None
-        # Auto-pause the active todo. We don't hold _lock for the
-        # potentially-HTTP server call.
-        if self._state == TrackerState.TRACKING and self._auto_paused_todo_id is None:
-            self._pause_active_todo(reason, end_iso)
-        self._state = new_state
-        if new_state != TrackerState.EXCLUDED:
-            self._excluded_app_name = None
-
-    def _transition_to_active(self, window: WindowInfo):
-        was_paused = self._state != TrackerState.TRACKING
-        if was_paused:
-            self._resume_auto_paused_todo()
-            now_iso = datetime.now(timezone.utc).isoformat()
-            self._open_activity(window, now_iso)
-            self._state = TrackerState.TRACKING
-            self._excluded_app_name = None
+            active = 0.0
+            window = None
+            excluded = False
+            self._last_state = "paused"
         else:
-            # Already tracking — handle window change.
-            if (self._current_window and
-                    window.process_name == self._current_window.process_name and
-                    window.window_title == self._current_window.window_title):
-                return
-            now_iso = datetime.now(timezone.utc).isoformat()
-            with self._lock:
-                if self._current_activity_id is not None:
-                    try:
-                        self._db.close_app_activity(self._current_activity_id, now_iso)
-                    except Exception:
-                        pass
-            self._open_activity(window, now_iso)
+            window = self._window_detector.get_active_window()
+            excluded = bool(window and window.is_excluded)
+            active = max(0.0, delta - idle)
+            if idle >= self._threshold:
+                self._last_state = "idle"
+            elif excluded:
+                self._last_state = "excluded"
+            else:
+                self._last_state = "active"
+        self._last_excluded_app = window.process_name if excluded else None
 
-    def _open_activity(self, window: WindowInfo, start_iso: str):
-        with self._lock:
-            try:
-                self._current_activity_id = self._db.open_app_activity(
-                    process_name=window.process_name,
-                    window_title=window.window_title,
-                    start_time=start_iso,
-                    todo_id=self._current_todo_id,
-                )
-            except Exception:
-                self._current_activity_id = None
-            self._current_window = window
-
-    # ── Todo auto pause / resume ────────────────────────────────
-
-    def _pause_active_todo(self, reason: str, end_iso: str):
+        active_todo_id = None
         try:
-            active = self._db.get_active_todo_session()
-        except Exception:
-            active = None
-        if not active:
-            return
-        try:
-            self._db.stop_todo_timer(active["todo_id"], reason=reason, end_time=end_iso)
-            self._auto_paused_todo_id = active["todo_id"]
-            self._current_todo_id = None
+            active_todo_id = self._backend.get_active_todo_id()
         except Exception:
             pass
 
-    def _resume_auto_paused_todo(self):
-        todo_id = self._auto_paused_todo_id
-        if not todo_id:
-            # Memory might be empty (e.g. tracker restart). Ask the server.
+        proc = window.process_name if window else "unknown"
+        credited_todo = active_todo_id if (active > 0 and not excluded) else None
+        try:
+            self._backend.push_tick(
+                event_id=str(uuid.uuid4()),
+                kst_date=self._kst_date(now),
+                active_seconds=int(round(active)),
+                process_name=proc,
+                excluded=excluded,
+                todo_id=credited_todo,
+                state=self._last_state,
+                idle_seconds=idle,
+                device_id=self._device_id,
+            )
+        except Exception:
+            pass
+
+        # Day rollover: in LOCAL mode the backend can complete crossed todos.
+        if hasattr(self._backend, "complete_day_crossed_todos"):
             try:
-                if hasattr(self._db, "get_recently_auto_paused_todo"):
-                    row = self._db.get_recently_auto_paused_todo()
-                    if row:
-                        todo_id = row["todo_id"]
+                self._backend.complete_day_crossed_todos()
             except Exception:
                 pass
-        if not todo_id:
-            return
-        try:
-            sid = self._db.start_todo_timer(todo_id)
-            if sid:  # None means the todo was completed → never resurrect it
-                self._current_todo_id = todo_id
-        except Exception:
-            pass
-        self._auto_paused_todo_id = None
 
-    # ── Public API ──────────────────────────────────────────────
+    @staticmethod
+    def _kst_date(dt_utc: datetime) -> str:
+        from datetime import timedelta
+        return (dt_utc.astimezone(timezone(timedelta(hours=9)))).strftime("%Y-%m-%d")
+
+    # ── Public API (tray / shutdown) ────────────────────────────
 
     def close_active_session(self):
-        """Force-close any in-flight activity. Called on shutdown."""
-        if self._current_activity_id is not None or self._current_todo_id is not None:
-            self._transition_to_paused(TrackerState.IDLE, "shutdown")
+        # Nothing to flush: time is accrued per tick, so there is no open
+        # interval to close. A final tick already credited elapsed active time.
+        pass
 
     def get_status(self) -> dict:
-        with self._lock:
-            state = self._state
-            if self._pause.is_set():
-                state = TrackerState.PAUSED
-            date_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            try:
-                total = self._db.get_today_todo_total_seconds(date_utc)
-            except Exception:
-                total = 0
-            return {
-                "state": state,
-                "today_total_seconds": total,
-                "excluded_app": self._excluded_app_name,
-                "idle_seconds": self._idle_detector.get_idle_seconds(),
-            }
+        date_kst = self._kst_date(datetime.now(timezone.utc))
+        try:
+            total = self._backend.get_today_todo_total_seconds(date_kst)
+        except Exception:
+            total = 0
+        return {
+            "state": "paused" if self._pause.is_set() else self._last_state,
+            "today_total_seconds": total,
+            "excluded_app": self._last_excluded_app,
+            "idle_seconds": self._last_idle,
+        }

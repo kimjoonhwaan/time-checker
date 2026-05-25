@@ -59,20 +59,6 @@ def _resolve_api_key(config: dict) -> str:
             or config.get("api_key") or "").strip()
 
 
-def _run_heartbeat(client, tracker, shutdown_event):
-    while not shutdown_event.is_set():
-        try:
-            status = tracker.get_status()
-            client.heartbeat(
-                state=status["state"],
-                idle_seconds=status["idle_seconds"],
-                excluded_app=status.get("excluded_app"),
-            )
-        except Exception:
-            pass
-        shutdown_event.wait(30)
-
-
 def main():
     config = _load_config()
     device_id = _ensure_device_id(config)
@@ -98,7 +84,7 @@ def main():
         backend = DatabaseManager(
             str(paths.server_db_path(config)),
             idle_threshold_seconds=config.get("idle_threshold_seconds", 60))
-        backend.cleanup_orphan_todo_sessions()  # tidy on startup
+        backend.cleanup()  # complete day-crossed todos, prune dedup keys
         flask_thread = threading.Thread(
             target=run_flask, args=(backend, None, config, shutdown_event),
             daemon=True, name="flask"
@@ -108,12 +94,6 @@ def main():
     tracker = TrackerLoop(backend, config, shutdown_event, pause_event)
     tracker_thread = threading.Thread(target=tracker.run, daemon=True, name="tracker")
     tracker_thread.start()
-
-    if server_url:
-        threading.Thread(
-            target=_run_heartbeat, args=(backend, tracker, shutdown_event),
-            daemon=True, name="heartbeat"
-        ).start()
 
     if flask_thread is not None:
         flask_thread.start()

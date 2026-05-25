@@ -3,7 +3,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tracker import TrackerState
 from tray import TrayApp, ICONS, _make_icon
 
 
@@ -18,14 +17,14 @@ class TestMakeIcon:
         img = _make_icon("#22c55e")
         assert img.mode == "RGBA"
 
-    def test_tracking_icon_exists(self):
-        assert TrackerState.TRACKING in ICONS
+    def test_active_icon_exists(self):
+        assert "active" in ICONS
 
     def test_idle_icon_exists(self):
-        assert TrackerState.IDLE in ICONS
+        assert "idle" in ICONS
 
     def test_paused_icon_exists(self):
-        assert TrackerState.PAUSED in ICONS
+        assert "paused" in ICONS
 
 
 # ── TrayApp helpers ───────────────────────────────────────────
@@ -36,7 +35,7 @@ def _make_tray(tracker_status=None):
 
     tracker = MagicMock()
     tracker.get_status.return_value = tracker_status or {
-        "state": TrackerState.TRACKING,
+        "state": "active",
         "today_total_seconds": 13320,  # 3h 42m
     }
     db = MagicMock()
@@ -52,25 +51,25 @@ def _make_tray(tracker_status=None):
 
 class TestStatusLabel:
     def test_format_hours_minutes(self):
-        tray, _, _ = _make_tray({"state": TrackerState.TRACKING, "today_total_seconds": 13320})
+        tray, _, _ = _make_tray({"state": "active", "today_total_seconds": 13320})
         label = tray._status_label()
         assert "3h" in label
         assert "42m" in label
 
-    def test_includes_state_label_tracking(self):
-        tray, _, _ = _make_tray({"state": TrackerState.TRACKING, "today_total_seconds": 0})
+    def test_includes_state_label_active(self):
+        tray, _, _ = _make_tray({"state": "active", "today_total_seconds": 0})
         assert "추적 중" in tray._status_label()
 
     def test_includes_state_label_idle(self):
-        tray, _, _ = _make_tray({"state": TrackerState.IDLE, "today_total_seconds": 0})
+        tray, _, _ = _make_tray({"state": "idle", "today_total_seconds": 0})
         assert "유휴" in tray._status_label()
 
     def test_includes_state_label_paused(self):
-        tray, _, _ = _make_tray({"state": TrackerState.PAUSED, "today_total_seconds": 0})
+        tray, _, _ = _make_tray({"state": "paused", "today_total_seconds": 0})
         assert "일시정지" in tray._status_label()
 
     def test_zero_time_format(self):
-        tray, _, _ = _make_tray({"state": TrackerState.IDLE, "today_total_seconds": 0})
+        tray, _, _ = _make_tray({"state": "idle", "today_total_seconds": 0})
         label = tray._status_label()
         assert "0h" in label
 

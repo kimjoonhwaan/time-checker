@@ -29,7 +29,7 @@ def _load_server_config() -> dict:
 config = _load_server_config()
 db = DatabaseManager(str(paths.server_db_path(config)),
                      idle_threshold_seconds=config.get("idle_threshold_seconds", 60))
-db.cleanup_orphan_todo_sessions()
+db.cleanup()
 init_app(
     db,
     tracker=None,

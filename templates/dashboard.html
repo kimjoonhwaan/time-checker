@@ -528,7 +528,10 @@
     const base = todo ? (todo.total_seconds || 0) : 0;
     const isActive = s.state === 'active' && todo && todo.status === 'in_progress';
     if (isActive) {
-      startLiveTimer(base);        // resets base + start anchor
+      // Re-anchor only when not yet running or when the server pushed a new
+      // (higher) stored total — otherwise keep ticking so it doesn't reset
+      // back to base every poll while the stored value is unchanged.
+      if (!_liveInterval || base > _liveBase) startLiveTimer(base);
     } else {
       stopLiveTimer();
       display.textContent = fmt(base);

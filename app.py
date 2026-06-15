@@ -20,6 +20,7 @@ _tracker = None
 _config_path: Path = paths.config_path()
 _api_key = None
 _KST = timezone(timedelta(hours=9))
+_last_day_cross_check = None  # KST date string — throttles day-cross to once/day
 
 
 def init_app(db, tracker=None, config_path: Path = None, api_key: str = None):
@@ -143,6 +144,14 @@ def ingest_tick():
         idle_seconds=d.get("idle_seconds", 0) or 0,
         device_id=d.get("device_id"),
     )
+    # REMOTE mode: dashboard may not be opened, so day-cross can't rely on the
+    # /api/todos GET path. Trigger here, once per KST day, on the next tick
+    # after midnight.
+    global _last_day_cross_check
+    today = _today_kst()
+    if _last_day_cross_check != today:
+        _db.complete_day_crossed_todos()
+        _last_day_cross_check = today
     return jsonify({"ok": True})
 
 
@@ -193,10 +202,7 @@ def _serialize_todo(t: dict) -> dict:
 @flask_app.route("/api/todos", methods=["GET"])
 def list_todos():
     # Self-heal: complete prior-day tasks on dashboard load too.
-    try:
-        _db.complete_day_crossed_todos()
-    except Exception:
-        pass
+    _db.complete_day_crossed_todos()
     status = request.args.get("status")
     todos = _db.get_todos(status_filter=status)
     return jsonify({

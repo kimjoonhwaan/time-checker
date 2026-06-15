@@ -114,6 +114,25 @@ class TestIngestTickIdempotent:
         assert client.get("/api/summary/today").get_json()["todo_total_seconds"] == 10
 
 
+class TestIngestTickTriggersDayCross:
+    def test_first_tick_completes_prior_day_todo(self, client):
+        # Yesterday's in_progress todo (no todo_time rows).
+        tid = client.post("/api/todos", json={"title": "old"}).get_json()["id"]
+        client.post(f"/api/todos/{tid}/start")
+        client._db._conn.execute(
+            "UPDATE todos SET created_at=? WHERE id=?",
+            ("2000-01-01T00:00:00+00:00", tid),
+        )
+        client._db._conn.commit()
+        # Reset the module-level throttle so this test's tick actually fires
+        # the day-cross check (other tests may have already set it).
+        app_module._last_day_cross_check = None
+        client.post("/api/ingest/tick", json={
+            "event_id": "x", "kst_date": _today(), "active_seconds": 1,
+            "process_name": "code.exe", "state": "active"})
+        assert client.get(f"/api/todos/{tid}").get_json()["status"] == "done"
+
+
 class TestAppsToday:
     def test_keys_and_percentage(self, client):
         client.post("/api/ingest/tick", json={

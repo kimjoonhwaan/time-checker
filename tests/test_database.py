@@ -76,6 +76,20 @@ class TestDayBoundary:
         assert mem_db.complete_day_crossed_todos() == 0
         assert mem_db.get_todo(tid)["status"] == "in_progress"
 
+    def test_prior_day_todo_without_any_time_still_completes(self, mem_db):
+        """A todo that was started yesterday but never accrued any time
+        (idle/excluded/offline) must still auto-complete via created_at."""
+        tid = mem_db.create_todo("never-worked")
+        mem_db.set_active_todo(tid)
+        # Backdate created_at to two days ago so the KST date is < today.
+        mem_db._conn.execute(
+            "UPDATE todos SET created_at=? WHERE id=?",
+            ("2000-01-01T00:00:00+00:00", tid),
+        )
+        mem_db._conn.commit()
+        assert mem_db.complete_day_crossed_todos() == 1
+        assert mem_db.get_todo(tid)["status"] == "done"
+
 
 class TestStats:
     def test_daily_summary_groups_by_date(self, mem_db):

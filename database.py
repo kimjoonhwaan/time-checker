@@ -405,9 +405,11 @@ class DatabaseManager:
         with self._lock:
             today_kst = self.kst_today()
             rows = self._conn.execute("""
-                SELECT t.id AS todo_id, MAX(tt.date) AS last_date
+                SELECT t.id AS todo_id,
+                       COALESCE(MAX(tt.date), date(t.created_at, '+9 hours'))
+                           AS last_date
                 FROM todos t
-                JOIN todo_time tt ON tt.todo_id = t.id
+                LEFT JOIN todo_time tt ON tt.todo_id = t.id
                 WHERE t.status IN ('in_progress', 'paused')
                 GROUP BY t.id
             """).fetchall()
